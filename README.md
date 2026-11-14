@@ -1,7 +1,7 @@
 # Ferram Aerospace Research Continued-Continued
 
 [![Build](https://github.com/dkavolis/Ferram-Aerospace-Research/actions/workflows/package.yml/badge.svg?branch=master)](https://github.com/dkavolis/Ferram-Aerospace-Research/actions/workflows/package.yml)  
-Download latest build [here](https://nightly.link/dkavolis/Ferram-Aerospace-Research/workflows/package/master/FerramAerospaceResearch.zip)  
+Download latest build [here](https://github.com/RealSteel99-codes/FARc-continued/releases/latest)  
 
 Fork of FARc meant for more of a focus on realism.
 Thank you to dkavolis for creating the original mod.
