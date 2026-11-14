@@ -1,4 +1,4 @@
-# Ferram Aerospace Research Continued-Continued
+# Ferram Aerospace Research Continued UnKerbalized
 
 Download latest build [here](https://github.com/RealSteel99-codes/FARc-continued/releases/latest)  
 
