@@ -75,7 +75,19 @@
     </Reference>
     <Reference Include="System" />
     <Reference Include="Unity.Mathematics">
-      <HintPath>C:\Zaidimai\KSP 1.12\GameData\000_KSPBurst\Plugins\Unity.Mathematics.dll</HintPath>
+      <HintPath>$(KSP_DIR_BUILD)\GameData\000_KSPBurst\Plugins\Unity.Mathematics.dll</HintPath>
+    </Reference>
+    <Reference Include="Unity.Burst">
+      <HintPath>$(KSP_DIR_BUILD)\GameData\000_KSPBurst\Plugins\Unity.Burst.dll</HintPath>
+    </Reference>
+    <Reference Include="Unity.Jobs">
+      <HintPath>$(KSP_DIR_BUILD)\GameData\000_KSPBurst\Plugins\Unity.Jobs.dll</HintPath>
+    </Reference>
+    <Reference Include="Unity.Collections">
+      <HintPath>$(KSP_DIR_BUILD)\GameData\000_KSPBurst\Plugins\Unity.Collections.dll</HintPath>
+    </Reference>
+    <Reference Include="KSPBurst">
+      <HintPath>$(KSP_DIR_BUILD)\GameData\000_KSPBurst\Plugins\KSPBurst.dll</HintPath>
     </Reference>
     <Reference Include="UnityEngine, Version=0.0.0.0, Culture=neutral, processorArchitecture=MSIL">
       <SpecificVersion>False</SpecificVersion>
@@ -157,6 +169,7 @@
     <Compile Include="FARAeroComponents\FARAeroPartModule.cs" />
     <Compile Include="FARAeroComponents\FARAeroSection.cs" />
     <Compile Include="FARAeroComponents\FARVesselAero.cs" />
+    <Compile Include="FARAeroComponents\FARVortexAero.cs" />
     <Compile Include="FARAeroComponents\VehicleAerodynamics.cs" />
     <Compile Include="FARAeroUtil.cs" />
     <Compile Include="LEGACYferram4\FARBaseAerodynamics.cs" />
@@ -189,6 +202,7 @@
     <Compile Include="FARPartGeometry\GeometryModification\StockProcFairingGeoUpdater.cs" />
     <Compile Include="FARPartGeometry\MeshData.cs" />
     <Compile Include="FARPartGeometry\PartGeometryExtensions.cs" />
+    <Compile Include="FARPartGeometry\FARVoxelBurstJobs.cs" />
     <Compile Include="FARPartGeometry\VehicleVoxel.cs" />
     <Compile Include="FARPartGeometry\VoxelCrossSection.cs" />
     <Compile Include="FARPartGeometry\VoxelChunk.cs" />

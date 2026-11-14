@@ -137,6 +137,9 @@ namespace ferram4
         public double EffectiveUpstreamAoA { get; private set; }
         public double EffectiveUpstreamCd0 { get; private set; }
         public double EffectiveUpstreamInfluence { get; private set; }
+        public double EffectiveStallDelayBonus { get; private set; }
+        public double WingletARMultiplier { get; private set; } = 1.0;
+        public double WingletEfficiencyMultiplier { get; private set; } = 1.0;
         public bool HasWingsUpstream { get; private set; }
 
         public double ARFactor { get; private set; } = 1;
@@ -166,6 +169,7 @@ namespace ferram4
             EffectiveUpstreamAoA = 0;
             EffectiveUpstreamCd0 = 0;
             EffectiveUpstreamInfluence = 0;
+            EffectiveStallDelayBonus = 0;
         }
 
         /// <summary>
@@ -262,6 +266,70 @@ namespace ferram4
             ClCdInterference += 0.5f * WingInterference(-forward, VesselPartList, flt_b_2);
 
             ClInterferenceFactor = ClCdInterference;
+
+            DetectAndApplyWingletInteractions();
+        }
+
+        private void DetectAndApplyWingletInteractions()
+        {
+            WingletARMultiplier = 1.0;
+            WingletEfficiencyMultiplier = 1.0;
+
+            if (parentWingPart == null || parentWingModule == null)
+                return;
+
+            // Check spanwise adjacent wing modules (leftward and rightward)
+            List<FARWingAerodynamicModel> spanwiseModules = new List<FARWingAerodynamicModel>();
+            if (nearbyWingModulesLeftwardList != null)
+                spanwiseModules.AddRange(nearbyWingModulesLeftwardList);
+            if (nearbyWingModulesRightwardList != null)
+                spanwiseModules.AddRange(nearbyWingModulesRightwardList);
+
+            // Also check child parts directly attached at the wing tip
+            foreach (Part child in parentWingPart.children)
+            {
+                if (child == null) continue;
+                FARWingAerodynamicModel childWing = child.GetComponent<FARWingAerodynamicModel>();
+                if (childWing != null && !spanwiseModules.Contains(childWing))
+                    spanwiseModules.Add(childWing);
+            }
+
+            Vector3 parentNormal = parentWingPart.partTransform.forward;
+            double parentSpan = Math.Max(0.5, parentWingModule.b_2_actual * 2.0);
+
+            foreach (FARWingAerodynamicModel winglet in spanwiseModules)
+            {
+                if (winglet == null || winglet == parentWingModule || winglet.part == null)
+                    continue;
+
+                Vector3 wingletNormal = winglet.part.partTransform.forward;
+                double dotNormals = Vector3.Dot(parentNormal, wingletNormal);
+                dotNormals = Math.Max(-1.0, Math.Min(1.0, dotNormals));
+                double dihedralAngleRad = Math.Acos(Math.Abs(dotNormals));
+                double dihedralAngleDeg = dihedralAngleRad * (180.0 / Math.PI);
+
+                double wingletHeight = Math.Max(winglet.b_2_actual, winglet.MAC_actual);
+
+                bool isWinglet = winglet.IsWinglet ||
+                                 FerramAerospaceResearch.FARAeroComponents.FARVortexAero.IsGeometricWinglet(
+                                     dihedralAngleDeg, wingletHeight, parentSpan);
+
+                if (isWinglet)
+                {
+                    winglet.IsWinglet = true;
+                    FerramAerospaceResearch.FARAeroComponents.FARVortexAero.CalculateWingletEffect(
+                        wingletHeight,
+                        parentSpan,
+                        dihedralAngleRad,
+                        out double arMult,
+                        out double eMult);
+
+                    if (arMult > WingletARMultiplier)
+                        WingletARMultiplier = arMult;
+                    if (eMult > WingletEfficiencyMultiplier)
+                        WingletEfficiencyMultiplier = eMult;
+                }
+            }
         }
 
         //This updates the interactions of all wings near this one; call this one when something changes rather than all of them at once
@@ -644,6 +712,7 @@ namespace ferram4
             EffectiveUpstreamAoA = 0;
             EffectiveUpstreamCd0 = 0;
             EffectiveUpstreamInfluence = 0;
+            EffectiveStallDelayBonus = 0;
 
             double wingForwardDir = parallelInPlaneLocal.y;
             double wingRightwardDir = parallelInPlaneLocal.x * srfAttachFlipped;
@@ -764,6 +833,18 @@ namespace ferram4
                 EffectiveUpstreamAoAMax += wingModule.rawAoAmax * wingInfluenceFactor;
                 EffectiveUpstreamCd0 += wingModule.GetCd0() * wingInfluenceFactor;
                 EffectiveUpstreamInfluence += wingInfluenceFactor;
+
+                if (wingModule.IsStrake)
+                {
+                    double delay = FerramAerospaceResearch.FARAeroComponents.FARVortexAero.CalculateStallDelay(
+                        wingModule.S,
+                        parentWingModule.S,
+                        wingInfluenceFactor,
+                        wingModule.VortexBurstFraction
+                    );
+                    if (delay > EffectiveStallDelayBonus)
+                        EffectiveStallDelayBonus = delay;
+                }
 
                 double wAoA = wingModule.CalculateAoA(wingModule.GetVelocity()) * Math.Sign(tmp);
                 //First, make sure that the AoA are wrt the same direction; then account for any strange angling of the part that shouldn't be there

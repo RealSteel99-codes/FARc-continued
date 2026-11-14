@@ -138,16 +138,26 @@ namespace FerramAerospaceResearch.FARThreading
                 return;
             }
 
-            var task = new Task(action);
-            lock (queuedMainThreadTasks)
+            using (var resetEvent = new ManualResetEventSlim(false))
             {
-                queuedMainThreadTasks.Enqueue(task);
-            }
+                var task = new Task(() =>
+                {
+                    try
+                    {
+                        action();
+                    }
+                    finally
+                    {
+                        resetEvent.Set();
+                    }
+                });
 
-            lock (task)
-            {
-                while (!task.Executed)
-                    Monitor.Wait(task);
+                lock (queuedMainThreadTasks)
+                {
+                    queuedMainThreadTasks.Enqueue(task);
+                }
+
+                resetEvent.Wait();
             }
         }
 
@@ -164,11 +174,7 @@ namespace FerramAerospaceResearch.FARThreading
                 }
 
                 task.Action();
-                lock (task)
-                {
-                    task.Executed = true;
-                    Monitor.Pulse(task);
-                }
+                task.Executed = true;
             }
         }
 

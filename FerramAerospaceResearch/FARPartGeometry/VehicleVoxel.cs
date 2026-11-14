@@ -1536,37 +1536,40 @@ namespace FerramAerospaceResearch.FARPartGeometry
             int jSec = j >> 3;
             int kSec = k >> 3;
 
-            VoxelChunk section;
+            VoxelChunk section = voxelChunks[iSec, jSec, kSec];
 
-            lock (voxelChunks)
+            if (section == null)
             {
-                section = voxelChunks[iSec, jSec, kSec];
-                if (section == null)
+                lock (voxelChunks)
                 {
-                    lock (clearedChunks)
-                    {
-                        if (clearedChunks.Count > 0)
-                            section = clearedChunks.Pop();
-                    }
-
+                    section = voxelChunks[iSec, jSec, kSec];
                     if (section == null)
-                        section = new VoxelChunk(ElementSize,
-                                                 LocalLowerRightCorner +
-                                                 new Vector3d(iSec, jSec, kSec) * ElementSize * 8,
-                                                 iSec * 8,
-                                                 jSec * 8,
-                                                 kSec * 8,
-                                                 partPriorities,
-                                                 useHigherResVoxels);
-                    else
-                        section.SetChunk(ElementSize,
-                                         LocalLowerRightCorner + new Vector3d(iSec, jSec, kSec) * ElementSize * 8,
-                                         iSec * 8,
-                                         jSec * 8,
-                                         kSec * 8,
-                                         partPriorities);
+                    {
+                        lock (clearedChunks)
+                        {
+                            if (clearedChunks.Count > 0)
+                                section = clearedChunks.Pop();
+                        }
 
-                    voxelChunks[iSec, jSec, kSec] = section;
+                        if (section == null)
+                            section = new VoxelChunk(ElementSize,
+                                                     LocalLowerRightCorner +
+                                                     new Vector3d(iSec, jSec, kSec) * ElementSize * 8,
+                                                     iSec * 8,
+                                                     jSec * 8,
+                                                     kSec * 8,
+                                                     partPriorities,
+                                                     useHigherResVoxels);
+                        else
+                            section.SetChunk(ElementSize,
+                                             LocalLowerRightCorner + new Vector3d(iSec, jSec, kSec) * ElementSize * 8,
+                                             iSec * 8,
+                                             jSec * 8,
+                                             kSec * 8,
+                                             partPriorities);
+
+                        voxelChunks[iSec, jSec, kSec] = section;
+                    }
                 }
             }
 

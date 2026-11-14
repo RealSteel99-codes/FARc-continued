@@ -220,6 +220,27 @@ namespace ferram4
                        stepIncrement = 0.05f)]
         public float minControl = 0.1f;
 
+        [KSPField(guiName = "Hinge Blowback", isPersistant = true, guiActiveEditor = true, guiActive = true),
+         UI_Toggle(affectSymCounterparts = UI_Scene.All, scene = UI_Scene.All, disabledText = "Off", enabledText = "On")]
+        public bool enableBlowback = true;
+
+        [KSPField(guiName = "Actuator Torque Limit", isPersistant = true, guiActiveEditor = true, guiActive = false),
+         UI_FloatRange(affectSymCounterparts = UI_Scene.All,
+                       maxValue = 50000f,
+                       minValue = 100f,
+                       scene = UI_Scene.Editor,
+                       stepIncrement = 100f)]
+        public float actuatorTorqueLimit = -1f; // -1 = auto-calculate based on part mass & surface area
+
+        [KSPField(isPersistant = false, guiActive = true, guiName = "Aero Hinge Torque")]
+        public string hingeTorqueDisplay = "0 N·m";
+
+        [KSPField(isPersistant = false, guiActive = true, guiName = "Control Blowback")]
+        public string blowbackDisplay = "100%";
+
+        protected double currentBlowbackRatio = 1.0;
+        protected double currentHingeTorqueNm = 0.0;
+
         protected double PitchLocation;
         protected double YawLocation;
         protected double RollLocation;
@@ -741,12 +762,78 @@ namespace ferram4
         // Determines current deflection contributions from stick and flap/spoiler settings and update current total deflection (AoAoffset).
         private void ChangeDeflection()
         {
-            if (!AoAcurrentControl.NearlyEqual(AoAdesiredControl))
-                AoAcurrentControl = BlendDeflectionExp(AoAcurrentControl, AoAdesiredControl, timeConstant, justStarted);
+            double targetControl = AoAdesiredControl;
+            double targetFlap = AoAdesiredFlap;
 
-            if (!AoAcurrentFlap.NearlyEqual(AoAdesiredFlap))
+            // Apply aeroelastic blowback limit if enabled
+            if (enableBlowback && HighLogic.LoadedSceneIsFlight && vessel != null && vessel.atmDensity > 0.001)
+            {
+                double q = vessel.dynamicPressurekPa;
+                double surfArea = Math.Max(0.01, S * ctrlSurfFrac);
+                double surfChord = Math.Max(0.05, MAC_actual * ctrlSurfFrac);
+                Vector3d vel = GetVelocity();
+                double surfaceAoA = vel.sqrMagnitude > 1.0 ? base.CalculateAoA(vel) : 0.0;
+                double mach = vessel.mach;
+
+                // Derive max actuator stall torque:
+                // If user customized actuatorTorqueLimit (>0), use it;
+                // Otherwise auto-scale dynamically with part mass, surface area, and massMultiplier.
+                // Works seamlessly for ANY stock or modded part without hardcoding!
+                // Sized so that at high dynamic pressures (transonic dash / high-speed pull-up),
+                // realistic control stiffening and blowback occur naturally.
+                double maxTorque = actuatorTorqueLimit > 0
+                    ? actuatorTorqueLimit
+                    : Math.Max(150.0, (part.mass * 14000.0) + (surfArea * 700.0)) * Math.Max(0.5, massMultiplier);
+
+                targetControl = FerramAerospaceResearch.FARAeroComponents.FARVortexAero.CalculateBlowbackDeflection(
+                    targetControl,
+                    q,
+                    surfArea,
+                    surfChord,
+                    surfaceAoA,
+                    mach,
+                    maxTorque,
+                    out double ctrlBlowbackRatio);
+
+                targetFlap = FerramAerospaceResearch.FARAeroComponents.FARVortexAero.CalculateBlowbackDeflection(
+                    targetFlap,
+                    q,
+                    surfArea,
+                    surfChord,
+                    surfaceAoA,
+                    mach,
+                    maxTorque,
+                    out double flapBlowbackRatio);
+
+                currentBlowbackRatio = Math.Min(ctrlBlowbackRatio, flapBlowbackRatio);
+
+                double totalDesiredRad = (targetControl + targetFlap) * (Math.PI / 180.0);
+                currentHingeTorqueNm = FerramAerospaceResearch.FARAeroComponents.FARVortexAero.CalculateHingeMoment(
+                    q,
+                    surfArea,
+                    surfChord,
+                    surfaceAoA,
+                    totalDesiredRad,
+                    mach);
+
+                hingeTorqueDisplay = $"{currentHingeTorqueNm:F0} N·m";
+                blowbackDisplay = currentBlowbackRatio < 0.99
+                    ? $"{currentBlowbackRatio * 100:F0}% (Blowback)"
+                    : "100%";
+            }
+            else
+            {
+                currentBlowbackRatio = 1.0;
+                hingeTorqueDisplay = "0 N·m";
+                blowbackDisplay = "100%";
+            }
+
+            if (!AoAcurrentControl.NearlyEqual(targetControl))
+                AoAcurrentControl = BlendDeflectionExp(AoAcurrentControl, targetControl, timeConstant, justStarted);
+
+            if (!AoAcurrentFlap.NearlyEqual(targetFlap))
                 AoAcurrentFlap = BlendDeflectionLinear(AoAcurrentFlap,
-                                                       AoAdesiredFlap,
+                                                       targetFlap,
                                                        maxdeflectFlap,
                                                        isSpoiler ? timeConstantSpoiler : timeConstantFlap,
                                                        justStarted);

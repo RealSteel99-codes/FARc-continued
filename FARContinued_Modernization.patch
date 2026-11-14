@@ -1,0 +1,1745 @@
+diff --git a/Directory.Build.props b/Directory.Build.props
+index 3f18423..f80e4a0 100644
+--- a/Directory.Build.props
++++ b/Directory.Build.props
+@@ -4,7 +4,7 @@
+     <KSP_DATA_DIRNAME>KSP_x64_Data</KSP_DATA_DIRNAME>
+     <UNITY_EDITOR_MANAGED_DIR>C:\Program Files\Unity\Hub\Editor\2019.4.18f1\Editor\Data\Managed\UnityEngine</UNITY_EDITOR_MANAGED_DIR>
+     <PostBuildCommand>
+-      cd "$(SolutionDir)""
++      cd "$(SolutionDir)"
+       python -m buildtools postbuild --dump-events -f "$(SolutionDir)config.json" -c "$(Configuration)" -t</PostBuildCommand>
+   </PropertyGroup>
+   <Import Project="Directory.Build.props.user" Condition=" Exists('Directory.Build.props.user') " />
+diff --git a/FerramAerospaceResearch/FARAeroComponents/FARVortexAero.cs b/FerramAerospaceResearch/FARAeroComponents/FARVortexAero.cs
+new file mode 100644
+index 0000000..2a7123f
+--- /dev/null
++++ b/FerramAerospaceResearch/FARAeroComponents/FARVortexAero.cs
+@@ -0,0 +1,437 @@
++using System;
++
++namespace FerramAerospaceResearch.FARAeroComponents
++{
++    /// <summary>
++    /// Modernized vortex lift, LERX (Leading Edge Root Extension), and winglet aerodynamics model.
++    /// Implements the Polhamus Leading-Edge Suction Analogy, vortex burst criteria,
++    /// downstream boundary layer energization (stall delay), ground effect calculations,
++    /// and Whitcomb wingtip vortex diffusion (effective AR and Oswald efficiency boost).
++    /// </summary>
++    public static class FARVortexAero
++    {
++        public enum StrakeMode
++        {
++            Auto = 0,
++            ForceLERX = 1,
++            ForceWinglet = 2,
++            ForceConventional = 3,
++            ForceWaverider = 4
++        }
++
++        /// <summary>
++        /// Geometric heuristic check for LERX / strakes:
++        /// Low aspect ratio (slender) and sharp leading edge sweep (Lambda >= 48 deg).
++        /// </summary>
++        public static bool IsGeometricStrake(double aspectRatio, double sweepAngleDeg)
++        {
++            return aspectRatio > 0.05 && aspectRatio <= 1.85 && sweepAngleDeg >= 48.0;
++        }
++
++        /// <summary>
++        /// Geometric check for winglets:
++        /// Significant cant/dihedral angle relative to main wing (>= 35 deg, e.g. vertical or canted),
++        /// moderate aspect ratio, and height-to-span ratio typical of wingtip devices.
++        /// </summary>
++        public static bool IsGeometricWinglet(double dihedralAngleDeg, double wingletSpan, double mainWingSpan)
++        {
++            if (mainWingSpan <= 0.1)
++                return false;
++
++            double heightRatio = wingletSpan / mainWingSpan;
++            double absDihedral = Math.Abs(dihedralAngleDeg);
++
++            // Canted/vertical surface (35° to 90°) with height ratio 0.04 to 0.45
++            return absDihedral >= 35.0 && heightRatio >= 0.04 && heightRatio <= 0.45;
++        }
++
++        /// <summary>
++        /// Calculates the effective Aspect Ratio multiplier and Oswald efficiency boost provided by a winglet.
++        /// Uses Whitcomb's semi-empirical winglet formulation:
++        /// Delta AR_eff = 1.8 * (h_winglet / b_wing) * sin(cantAngle)
++        /// Delta e = 0.12 * sin(cantAngle)
++        /// </summary>
++        public static void CalculateWingletEffect(
++            double wingletSpan,
++            double mainWingSpan,
++            double cantAngleRad,
++            out double arMultiplier,
++            out double oswaldEfficiencyMultiplier)
++        {
++            if (mainWingSpan <= 0.1 || wingletSpan <= 0.01)
++            {
++                arMultiplier = 1.0;
++                oswaldEfficiencyMultiplier = 1.0;
++                return;
++            }
++
++            double h_over_b = Math.Min(0.40, wingletSpan / mainWingSpan);
++            double sinCant = Math.Sin(Math.Abs(cantAngleRad));
++            sinCant = Math.Max(0.2, sinCant); // clamp for canted winglets
++
++            // Whitcomb's classical winglet AR increment: 1.8 * (h / b) * sin(cant)
++            double deltaArFraction = 1.8 * h_over_b * sinCant;
++            // Cap at 35% boost for extreme winglet heights to keep within physical limits
++            deltaArFraction = Math.Min(0.35, Math.Max(0.0, deltaArFraction));
++            arMultiplier = 1.0 + deltaArFraction;
++
++            // Oswald efficiency factor increase from vortex diffusion at tip
++            double deltaE = 0.14 * sinCant * (h_over_b / 0.15);
++            deltaE = Math.Min(0.20, Math.Max(0.0, deltaE));
++            oswaldEfficiencyMultiplier = 1.0 + deltaE;
++        }
++
++        /// <summary>
++        /// Calculates the Polhamus vortex lift coefficient factor Kv based on sweep angle and Mach number.
++        /// In the suction analogy, the leading-edge suction that would exist in attached flow
++        /// is rotated 90 degrees to act normal to the upper surface.
++        /// </summary>
++        public static double CalculateKv(double sweepRad, double mach)
++        {
++            double cosSweep = Math.Cos(sweepRad);
++            double sinSweep = Math.Sin(sweepRad);
++
++            // Compressibility adjustment for swept leading edges
++            double mTerm = 1.0 - (mach * mach * sinSweep * sinSweep);
++            if (mTerm < 0.05)
++                mTerm = 0.05;
++
++            // Theoretical Polhamus suction factor: Kv = pi * cos(Lambda) / sqrt(1 - M^2 * sin^2(Lambda))
++            double kv = (Math.PI * cosSweep) / Math.Sqrt(mTerm);
++
++            // Cap at realistic physical maximum for slender wings
++            return Math.Min(kv, 3.8);
++        }
++
++        /// <summary>
++        /// Calculates the potential lift slope factor Kp for a low-aspect-ratio slender surface (Helmbold formula).
++        /// </summary>
++        public static double CalculateKp(double aspectRatio, double mach)
++        {
++            double ar2 = Math.Max(0.1, aspectRatio * 0.5);
++            double mTerm = 1.0 - (mach * mach);
++            double denom = Math.Sqrt(Math.Max(0.04, mTerm + ar2 * ar2));
++            return (Math.PI * ar2) / denom;
++        }
++
++        /// <summary>
++        /// Calculates the critical vortex burst (breakdown) angle of attack in radians.
++        /// Higher sweep delays breakdown to higher angles of attack.
++        /// Transonic shock-induced adverse pressure gradient lowers the burst angle.
++        /// </summary>
++        public static double CalculateBurstAoA(double sweepRad, double mach)
++        {
++            double sweepDeg = sweepRad * (180.0 / Math.PI);
++            // Empirical baseline: for 60° sweep ~ 33° burst; for 75° sweep ~ 42° burst.
++            double baseBurstDeg = 18.0 + 0.35 * sweepDeg;
++
++            // Transonic Mach compression lowers burst threshold
++            double machFactor = 1.0 / Math.Sqrt(1.0 + 0.5 * mach * mach);
++            double burstDeg = baseBurstDeg * machFactor;
++
++            return burstDeg * (Math.PI / 180.0);
++        }
++
++        /// <summary>
++        /// Computes the fraction of vortex breakdown (0 = fully coherent, 1 = fully burst).
++        /// </summary>
++        public static double CalculateBurstFraction(double absAoA, double burstAoA)
++        {
++            if (absAoA <= burstAoA)
++                return 0.0;
++
++            const double burstTransitionWidthRad = 15.0 * (Math.PI / 180.0);
++            double burstFrac = (absAoA - burstAoA) / burstTransitionWidthRad;
++            return Math.Min(1.0, Math.Max(0.0, burstFrac));
++        }
++
++        /// <summary>
++        /// Computes Polhamus non-linear aerodynamic coefficients for a strake / LERX.
++        /// Normal force: Cn = Kp * sin(alpha) * cos^2(alpha) + Kv * sin^2(alpha) * cos(alpha)
++        /// Lift: Cl = Cn * cos(alpha)
++        /// Induced Drag: Cdi = Cn * sin(alpha)
++        /// </summary>
++        public static void CalculateStrakeAero(
++            double aoa,
++            double mach,
++            double aspectRatio,
++            double sweepRad,
++            out double cl,
++            out double cdInduced,
++            out double burstFraction,
++            out double acShiftFraction)
++        {
++            double absAoA = Math.Abs(aoa);
++            double sign = Math.Sign(aoa);
++            if (sign == 0) sign = 1;
++
++            double cosAoA = Math.Cos(absAoA);
++            double sinAoA = Math.Sin(absAoA);
++
++            double kp = CalculateKp(aspectRatio, mach);
++            double kv = CalculateKv(sweepRad, mach);
++
++            double burstAoA = CalculateBurstAoA(sweepRad, mach);
++            burstFraction = CalculateBurstFraction(absAoA, burstAoA);
++
++            // As vortex breaks down, suction lift collapses
++            double effectiveKv = kv * (1.0 - 0.75 * burstFraction);
++
++            // Normal force decomposition
++            double cnPotential = kp * sinAoA * cosAoA * cosAoA;
++            double cnVortex = effectiveKv * sinAoA * sinAoA * cosAoA;
++            double cnTotal = cnPotential + cnVortex;
++
++            // Wind axes
++            cl = sign * cnTotal * cosAoA;
++            cdInduced = cnTotal * sinAoA;
++
++            // Post-burst separated flow drag jump
++            if (burstFraction > 0.0)
++            {
++                cdInduced += 1.3 * burstFraction * sinAoA * sinAoA;
++            }
++
++            // Aerodynamic Center shift: coherent vortex pulls AC aft;
++            // burst causes loss of suction over the rear of the strake, causing pitch-up (shift forward).
++            acShiftFraction = burstFraction * 0.25;
++        }
++
++        /// <summary>
++        /// Calculates the stall angle delay bonus (in radians) provided to downstream main wing segments.
++        /// Coherent leading-edge vortex energizes the downstream boundary layer and induces favorable axial pressure.
++        /// </summary>
++        public static double CalculateStallDelay(
++            double strakeArea,
++            double mainWingArea,
++            double alignmentFactor,
++            double strakeBurstFraction)
++        {
++            // Typical maximum stall delay for LERX-wing configurations (e.g. F/A-18, F-16) is ~+12° to +18°
++            const double maxDelayRad = 15.0 * (Math.PI / 180.0);
++            double areaWeight = Math.Min(1.0, (strakeArea * 2.2) / Math.Max(0.1, mainWingArea));
++            double coherence = Math.Max(0.0, 1.0 - strakeBurstFraction);
++
++            return maxDelayRad * areaWeight * Math.Max(0.0, alignmentFactor) * coherence;
++        }
++
++        /// <summary>
++        /// Calculates Wieselsberger mirror-vortex ground effect parameters.
++        /// </summary>
++        /// <param name="altitudeAboveGround">Height of wing above surface (m)</param>
++        /// <param name="wingSpan">Total wing span (m)</param>
++        /// <param name="dragFactor">Induced drag reduction factor (<= 1.0)</param>
++        /// <param name="liftSlopeMultiplier">Lift slope augmentation multiplier (>= 1.0)</param>
++        public static void CalculateGroundEffect(
++            double altitudeAboveGround,
++            double wingSpan,
++            out double dragFactor,
++            out double liftSlopeMultiplier)
++        {
++            if (wingSpan <= 0.1 || altitudeAboveGround >= wingSpan * 1.5)
++            {
++                dragFactor = 1.0;
++                liftSlopeMultiplier = 1.0;
++                return;
++            }
++
++            double h_over_b = Math.Max(0.02, altitudeAboveGround / wingSpan);
++
++            // Wieselsberger ground effect induced drag reduction formula:
++            // sigma = 16 * (h/b)^2 / (1 + 16 * (h/b)^2)
++            double hbSq16 = 16.0 * h_over_b * h_over_b;
++            dragFactor = hbSq16 / (1.0 + hbSq16);
++            dragFactor = Math.Min(1.0, Math.Max(0.15, dragFactor));
++
++            // Lift slope augmentation from reduced downwash
++            liftSlopeMultiplier = 1.0 + (1.0 - dragFactor) * 0.22;
++        }
++
++        /// <summary>
++        /// Calculates aerodynamic hinge moment (torque in N*m) on a control surface.
++        /// H = Ch * q * S_tab * c_tab
++        /// where Ch represents the aerodynamic moment required to deflect the surface away from trail:
++        /// Ch = |Ch_delta| * |delta| + |Ch_alpha| * |alpha|
++        /// </summary>
++        /// <param name="dynamicPressurekPa">Dynamic pressure in kPa</param>
++        /// <param name="surfaceArea">Area of control surface in m^2</param>
++        /// <param name="chord">Mean chord of control surface in m</param>
++        /// <param name="aoaRad">Angle of attack of the surface in radians</param>
++        /// <param name="deflectionRad">Surface deflection in radians</param>
++        /// <param name="mach">Flight Mach number</param>
++        /// <returns>Aerodynamic hinge moment restoring torque in N*m</returns>
++        public static double CalculateHingeMoment(
++            double dynamicPressurekPa,
++            double surfaceArea,
++            double chord,
++            double aoaRad,
++            double deflectionRad,
++            double mach)
++        {
++            // Dynamic pressure in Pascals (N/m^2)
++            double q_Pa = dynamicPressurekPa * 1000.0;
++            if (q_Pa <= 1.0 || surfaceArea <= 0.001 || chord <= 0.01)
++                return 0.0;
++
++            // Compressibility Prandtl-Glauert factor for subsonic/transonic hinge slope
++            double prandtl = mach < 0.9 ? 1.0 / Math.Sqrt(Math.Max(0.2, 1.0 - mach * mach)) : 1.35;
++            if (mach > 1.2)
++                prandtl = 1.0 / Math.Sqrt(Math.Max(0.2, mach * mach - 1.0));
++
++            // Standard NACA empirical hinge moment derivative:
++            // Ch_delta ~ -0.45 * prandtl, Ch_alpha ~ -0.20 * prandtl
++            double ch_delta = 0.45 * prandtl;
++            double ch_alpha = 0.20 * prandtl;
++
++            // Torque required to hold deflection against dynamic air stream and angle of attack
++            double Ch = (ch_delta * Math.Abs(deflectionRad)) + (ch_alpha * Math.Abs(aoaRad));
++
++            return Ch * q_Pa * surfaceArea * chord;
++        }
++
++        /// <summary>
++        /// Calculates the dynamic blowback allowable deflection limit given available actuator torque.
++        /// When aero hinge moment equals actuator max torque capacity, deflection cannot exceed this limit.
++        /// </summary>
++        /// <param name="desiredDeflectionDeg">Pilot/SAS commanded deflection in degrees</param>
++        /// <param name="dynamicPressurekPa">Dynamic pressure in kPa</param>
++        /// <param name="surfaceArea">Area of control surface in m^2</param>
++        /// <param name="chord">Mean chord of control surface in m</param>
++        /// <param name="aoaRad">Angle of attack in radians</param>
++        /// <param name="mach">Flight Mach number</param>
++        /// <param name="maxTorqueNm">Actuator stall torque in N*m</param>
++        /// <param name="blowbackRatio">Output fraction of commanded deflection achieved (0.0 to 1.0)</param>
++        /// <returns>Allowed deflection in degrees</returns>
++        public static double CalculateBlowbackDeflection(
++            double desiredDeflectionDeg,
++            double dynamicPressurekPa,
++            double surfaceArea,
++            double chord,
++            double aoaRad,
++            double mach,
++            double maxTorqueNm,
++            out double blowbackRatio)
++        {
++            if (Math.Abs(desiredDeflectionDeg) < 0.01 || maxTorqueNm <= 0.0)
++            {
++                blowbackRatio = 1.0;
++                return desiredDeflectionDeg;
++            }
++
++            double desiredRad = desiredDeflectionDeg * (Math.PI / 180.0);
++            double requiredTorque = CalculateHingeMoment(dynamicPressurekPa, surfaceArea, chord, aoaRad, desiredRad, mach);
++
++            if (requiredTorque <= maxTorqueNm)
++            {
++                blowbackRatio = 1.0;
++                return desiredDeflectionDeg;
++            }
++
++            // Actuator torque is exceeded: surface blows back until aero hinge moment matches actuator torque
++            blowbackRatio = Math.Max(0.05, maxTorqueNm / requiredTorque);
++            return desiredDeflectionDeg * blowbackRatio;
++        }
++
++        /// <summary>
++        /// Heuristic check for waverider geometry:
++        /// Swept delta / wedge geometry (Lambda >= 44 deg) and moderate aspect ratio (AR &lt;= 3.2).
++        /// Captures classic deltas (MiG-21, Concorde, F-106, XB-70) and lifting bodies.
++        /// </summary>
++        public static bool IsGeometricWaverider(double aspectRatio, double sweepAngleDeg)
++        {
++            return aspectRatio > 0.05 && aspectRatio <= 3.2 && sweepAngleDeg >= 44.0;
++        }
++
++        /// <summary>
++        /// Calculates supersonic/hypersonic waverider compression lift and wave drag reduction.
++        /// When Mach >= 1.8 and sweep angle exceeds or matches the Mach angle (mu = asin(1/M)),
++        /// the planar oblique shock attaches to the leading edge. The post-shock high pressure is
++        /// trapped completely beneath the lower wedge, creating compression lift with minimal tip leakage.
++        /// </summary>
++        /// <param name="aoaRad">Angle of attack in radians</param>
++        /// <param name="mach">Flight Mach number</param>
++        /// <param name="sweepRad">Leading edge sweep angle in radians</param>
++        /// <param name="clCompression">Output compression lift coefficient</param>
++        /// <param name="cdWave">Output wave drag coefficient</param>
++        /// <param name="shockAttached">Whether the oblique shock is attached to the leading edge</param>
++        public static void CalculateWaveriderHypersonicAero(
++            double aoaRad,
++            double mach,
++            double sweepRad,
++            out double clCompression,
++            out double cdWave,
++            out bool shockAttached)
++        {
++            double absAoA = Math.Abs(aoaRad);
++            double signAoA = Math.Sign(aoaRad);
++            if (signAoA == 0) signAoA = 1.0;
++
++            if (mach < 1.8 || absAoA < 1e-4)
++            {
++                clCompression = 0.0;
++                cdWave = 0.0;
++                shockAttached = false;
++                return;
++            }
++
++            // Normal Mach component relative to the swept leading edge
++            double normalMach = mach * Math.Cos(sweepRad);
++
++            // Maximum wedge angle before shock detachment (theta_max approximation for gamma=1.4)
++            // Generous detachment corridor: up to 35-45 degrees
++            double thetaMaxRad = Math.Max(30.0 * (Math.PI / 180.0), 45.0 * (Math.PI / 180.0) * (1.0 - 1.0 / (mach * mach)));
++
++            // Shock attachment:
++            // Swept supersonic/hypersonic leading edge with AoA within theta_max
++            double sinMachAngle = 1.0 / mach;
++            double cosSweep = Math.Cos(sweepRad);
++            shockAttached = (cosSweep >= sinMachAngle * 0.55) && (absAoA <= thetaMaxRad);
++
++            const double gamma = 1.4;
++
++            if (shockAttached)
++            {
++                // Oblique shock wave angle beta approximation using theta-beta-M relation:
++                // For supersonic/hypersonic slender wedge: (beta / theta) ~ (gamma + 1)/2 + sqrt(((gamma+1)/2)^2 + (1/(M*theta))^2)
++                double mTheta = mach * Math.Max(0.01, absAoA);
++                double betaOverTheta = ((gamma + 1.0) / 4.0) + Math.Sqrt(Math.Pow((gamma + 1.0) / 4.0, 2) + 1.0 / Math.Max(0.01, mTheta * mTheta));
++                double betaRad = Math.Min(Math.PI * 0.48, absAoA * betaOverTheta);
++
++                // Normal Mach ahead of oblique shock
++                double m1n = mach * Math.Sin(betaRad);
++                m1n = Math.Max(1.0, m1n);
++
++                // Post-shock pressure ratio (Rankine-Hugoniot):
++                // p2/p1 = 1 + (2*gamma/(gamma+1)) * (M1n^2 - 1)
++                double pRatioLower = 1.0 + (2.0 * gamma / (gamma + 1.0)) * (m1n * m1n - 1.0);
++
++                // Lower surface pressure coefficient: Cp_lower = (2 / (gamma * M^2)) * (p2/p1 - 1)
++                double cpLower = (2.0 / (gamma * mach * mach)) * (pRatioLower - 1.0);
++
++                // Upper surface is in Prandtl-Meyer expansion fan (shielded shadow zone)
++                // At high Mach, upper surface pressure rapidly approaches near-vacuum (Cp_upper -> -2 / (gamma * M^2))
++                double cpUpper = -Math.Min(2.0 / (gamma * mach * mach), 0.5 * cpLower);
++
++                // Net normal pressure coefficient: Delta Cp = Cp_lower - Cp_upper
++                double deltaCp = cpLower - cpUpper;
++
++                // Waverider entrapment factor: 3D tip spillage is diffused/blocked by the attached shock curtain.
++                const double entrapmentFactor = 0.90;
++
++                clCompression = deltaCp * Math.Cos(absAoA) * entrapmentFactor * signAoA;
++                // Wave drag is the pressure force component aligned with flow: Cdw = Delta Cp * sin(alpha)
++                double tareWaveDrag = 0.003 / Math.Sqrt(Math.Max(1.0, mach));
++                cdWave = (deltaCp * Math.Sin(absAoA) * entrapmentFactor) + tareWaveDrag;
++            }
++            else
++            {
++                // Detached shock / shock spillage regime:
++                double sinAoA = Math.Sin(absAoA);
++                double cpNewtonian = 2.0 * sinAoA * sinAoA;
++
++                clCompression = cpNewtonian * Math.Cos(absAoA) * signAoA;
++                cdWave = cpNewtonian * sinAoA;
++            }
++        }
++    }
++}
+diff --git a/FerramAerospaceResearch/FARPartGeometry/FARVoxelBurstJobs.cs b/FerramAerospaceResearch/FARPartGeometry/FARVoxelBurstJobs.cs
+new file mode 100644
+index 0000000..8a4c898
+--- /dev/null
++++ b/FerramAerospaceResearch/FARPartGeometry/FARVoxelBurstJobs.cs
+@@ -0,0 +1,45 @@
++using System;
++using Unity.Burst;
++using Unity.Collections;
++using Unity.Jobs;
++using Unity.Mathematics;
++using UnityEngine;
++
++namespace FerramAerospaceResearch.FARPartGeometry
++{
++    [BurstCompile(FloatMode = FloatMode.Fast, FloatPrecision = FloatPrecision.Standard)]
++    public struct SweepPlaneCrossSectionJob : IJobParallelFor
++    {
++        [ReadOnly] public NativeArray<float3> chunkPositions;
++        [ReadOnly] public NativeArray<float> chunkOccupancies;
++        [ReadOnly] public float4 planeEquation; // (nx, ny, nz, d)
++        [ReadOnly] public float planeStep;
++        [ReadOnly] public float elementArea;
++        [ReadOnly] public float elementSize;
++
++        [WriteOnly] public NativeArray<float> outSliceAreas;
++        [WriteOnly] public NativeArray<float3> outSliceCentroids;
++
++        public void Execute(int sliceIndex)
++        {
++            float currentD = planeEquation.w + sliceIndex * planeStep;
++            float totalArea = 0f;
++            float3 centroidSum = float3.zero;
++
++            for (int c = 0; c < chunkPositions.Length; c++)
++            {
++                float dist = math.dot(chunkPositions[c], planeEquation.xyz) + currentD;
++                // If chunk intersects slice plane within threshold
++                if (math.abs(dist) < elementSize * 4f)
++                {
++                    float occ = chunkOccupancies[c];
++                    totalArea += occ * elementArea;
++                    centroidSum += chunkPositions[c] * occ;
++                }
++            }
++
++            outSliceAreas[sliceIndex] = totalArea;
++            outSliceCentroids[sliceIndex] = totalArea > 1e-4f ? (centroidSum / totalArea) : float3.zero;
++        }
++    }
++}
+diff --git a/FerramAerospaceResearch/FARPartGeometry/VehicleVoxel.cs b/FerramAerospaceResearch/FARPartGeometry/VehicleVoxel.cs
+index ea256fb..5a7a7e7 100644
+--- a/FerramAerospaceResearch/FARPartGeometry/VehicleVoxel.cs
++++ b/FerramAerospaceResearch/FARPartGeometry/VehicleVoxel.cs
+@@ -1536,37 +1536,40 @@ namespace FerramAerospaceResearch.FARPartGeometry
+             int jSec = j >> 3;
+             int kSec = k >> 3;
+ 
+-            VoxelChunk section;
++            VoxelChunk section = voxelChunks[iSec, jSec, kSec];
+ 
+-            lock (voxelChunks)
++            if (section == null)
+             {
+-                section = voxelChunks[iSec, jSec, kSec];
+-                if (section == null)
++                lock (voxelChunks)
+                 {
+-                    lock (clearedChunks)
++                    section = voxelChunks[iSec, jSec, kSec];
++                    if (section == null)
+                     {
+-                        if (clearedChunks.Count > 0)
+-                            section = clearedChunks.Pop();
+-                    }
++                        lock (clearedChunks)
++                        {
++                            if (clearedChunks.Count > 0)
++                                section = clearedChunks.Pop();
++                        }
+ 
+-                    if (section == null)
+-                        section = new VoxelChunk(ElementSize,
+-                                                 LocalLowerRightCorner +
+-                                                 new Vector3d(iSec, jSec, kSec) * ElementSize * 8,
+-                                                 iSec * 8,
+-                                                 jSec * 8,
+-                                                 kSec * 8,
+-                                                 partPriorities,
+-                                                 useHigherResVoxels);
+-                    else
+-                        section.SetChunk(ElementSize,
+-                                         LocalLowerRightCorner + new Vector3d(iSec, jSec, kSec) * ElementSize * 8,
+-                                         iSec * 8,
+-                                         jSec * 8,
+-                                         kSec * 8,
+-                                         partPriorities);
+-
+-                    voxelChunks[iSec, jSec, kSec] = section;
++                        if (section == null)
++                            section = new VoxelChunk(ElementSize,
++                                                     LocalLowerRightCorner +
++                                                     new Vector3d(iSec, jSec, kSec) * ElementSize * 8,
++                                                     iSec * 8,
++                                                     jSec * 8,
++                                                     kSec * 8,
++                                                     partPriorities,
++                                                     useHigherResVoxels);
++                        else
++                            section.SetChunk(ElementSize,
++                                             LocalLowerRightCorner + new Vector3d(iSec, jSec, kSec) * ElementSize * 8,
++                                             iSec * 8,
++                                             jSec * 8,
++                                             kSec * 8,
++                                             partPriorities);
++
++                        voxelChunks[iSec, jSec, kSec] = section;
++                    }
+                 }
+             }
+ 
+diff --git a/FerramAerospaceResearch/FARThreading/VoxelizationThreadpool.cs b/FerramAerospaceResearch/FARThreading/VoxelizationThreadpool.cs
+index 4356c58..f97c857 100644
+--- a/FerramAerospaceResearch/FARThreading/VoxelizationThreadpool.cs
++++ b/FerramAerospaceResearch/FARThreading/VoxelizationThreadpool.cs
+@@ -1,187 +1,193 @@
+-/*
+-Ferram Aerospace Research v0.16.1.2 "Marangoni"
+-=========================
+-Aerodynamics model for Kerbal Space Program
+-
+-Copyright 2022, Michael Ferrara, aka Ferram4
+-
+-   This file is part of Ferram Aerospace Research.
+-
+-   Ferram Aerospace Research is free software: you can redistribute it and/or modify
+-   it under the terms of the GNU General Public License as published by
+-   the Free Software Foundation, either version 3 of the License, or
+-   (at your option) any later version.
+-
+-   Ferram Aerospace Research is distributed in the hope that it will be useful,
+-   but WITHOUT ANY WARRANTY; without even the implied warranty of
+-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+-   GNU General Public License for more details.
+-
+-   You should have received a copy of the GNU General Public License
+-   along with Ferram Aerospace Research.  If not, see <http://www.gnu.org/licenses/>.
+-
+-   Serious thanks:		a.g., for tons of bugfixes and code-refactorings
+-				stupid_chris, for the RealChuteLite implementation
+-            			Taverius, for correcting a ton of incorrect values
+-				Tetryds, for finding lots of bugs and issues and not letting me get away with them, and work on example crafts
+-            			sarbian, for refactoring code for working with MechJeb, and the Module Manager updates
+-            			ialdabaoth (who is awesome), who originally created Module Manager
+-                        	Regex, for adding RPM support
+-				DaMichel, for some ferramGraph updates and some control surface-related features
+-            			Duxwing, for copy editing the readme
+-
+-   CompatibilityChecker by Majiir, BSD 2-clause http://opensource.org/licenses/BSD-2-Clause
+-
+-   Part.cfg changes powered by sarbian & ialdabaoth's ModuleManager plugin; used with permission
+-	http://forum.kerbalspaceprogram.com/threads/55219
+-
+-   ModularFLightIntegrator by Sarbian, Starwaster and Ferram4, MIT: http://opensource.org/licenses/MIT
+-	http://forum.kerbalspaceprogram.com/threads/118088
+-
+-   Toolbar integration powered by blizzy78's Toolbar plugin; used with permission
+-	http://forum.kerbalspaceprogram.com/threads/60863
+- */
+-
+-using System;
+-using System.Collections.Generic;
+-using System.Threading;
+-
+-namespace FerramAerospaceResearch.FARThreading
+-{
+-    //This class only exists to ensure that the ThreadPool is not choked with requests to start running voxels, which will deadlock the entire voxelization process when the MaxThread limit is reached because they will be unable to start up their various worker threads
+-    internal class VoxelizationThreadpool
+-    {
+-        private const int THREAD_COUNT = 8;
+-
+-        public static readonly VoxelizationThreadpool Instance = new VoxelizationThreadpool();
+-
+-        public static bool RunInMainThread = false;
+-
+-        private readonly Queue<Task> queuedMainThreadTasks;
+-
+-        private readonly Thread[] _threads;
+-        private readonly Queue<Action> queuedVoxelizations;
+-
+-        private Thread _mainThread;
+-
+-        // Explicit static constructor to tell C# compiler not to mark type as beforefieldinit
+-        static VoxelizationThreadpool()
+-        {
+-        }
+-
+-        private VoxelizationThreadpool()
+-        {
+-            _threads = new Thread[THREAD_COUNT];
+-            queuedVoxelizations = new Queue<Action>();
+-            queuedMainThreadTasks = new Queue<Task>();
+-            for (int i = 0; i < _threads.Length; i++)
+-            {
+-                _threads[i] = new Thread(ExecuteQueuedVoxelization);
+-                _threads[i].Start();
+-            }
+-
+-            // make sure we get main thread while in main thread, ctor is not guaranteed to be run in main thread
+-            queuedMainThreadTasks.Enqueue(new Task(SetupMainThread));
+-        }
+-
+-        public bool inMainThread
+-        {
+-            get { return _mainThread == Thread.CurrentThread; }
+-        }
+-
+-        ~VoxelizationThreadpool()
+-        {
+-            for (int i = 0; i < _threads.Length; i++)
+-                //this will pass a null action to each thread, ending it
+-                QueueVoxelization(null);
+-        }
+-
+-        private void SetupMainThread()
+-        {
+-            _mainThread = Thread.CurrentThread;
+-        }
+-
+-        private void ExecuteQueuedVoxelization()
+-        {
+-            while (true)
+-            {
+-                Action task;
+-                lock (this)
+-                {
+-                    while (queuedVoxelizations.Count == 0)
+-                        Monitor.Wait(this);
+-
+-                    task = queuedVoxelizations.Dequeue();
+-                }
+-
+-                if (task != null)
+-                    task();
+-                else
+-                    break;
+-            }
+-        }
+-
+-        public void QueueVoxelization(Action voxelAction)
+-        {
+-            lock (this)
+-            {
+-                queuedVoxelizations.Enqueue(voxelAction);
+-                Monitor.Pulse(this);
+-            }
+-        }
+-
+-        public void RunOnMainThread(Action action)
+-        {
+-            if (inMainThread)
+-            {
+-                action();
+-                return;
+-            }
+-
+-            var task = new Task(action);
+-            lock (queuedMainThreadTasks)
+-            {
+-                queuedMainThreadTasks.Enqueue(task);
+-            }
+-
+-            lock (task)
+-            {
+-                while (!task.Executed)
+-                    Monitor.Wait(task);
+-            }
+-        }
+-
+-        public void ExecuteMainThreadTasks()
+-        {
+-            while (true)
+-            {
+-                Task task;
+-                lock (queuedMainThreadTasks)
+-                {
+-                    if (queuedMainThreadTasks.Count == 0)
+-                        break;
+-                    task = queuedMainThreadTasks.Dequeue();
+-                }
+-
+-                task.Action();
+-                lock (task)
+-                {
+-                    task.Executed = true;
+-                    Monitor.Pulse(task);
+-                }
+-            }
+-        }
+-
+-        public class Task
+-        {
+-            public readonly Action Action;
+-            public bool Executed;
+-
+-            public Task(Action action)
+-            {
+-                Action = action;
+-                Executed = false;
+-            }
+-        }
+-    }
+-}
++/*
++Ferram Aerospace Research v0.16.1.2 "Marangoni"
++=========================
++Aerodynamics model for Kerbal Space Program
++
++Copyright 2022, Michael Ferrara, aka Ferram4
++
++   This file is part of Ferram Aerospace Research.
++
++   Ferram Aerospace Research is free software: you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation, either version 3 of the License, or
++   (at your option) any later version.
++
++   Ferram Aerospace Research is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with Ferram Aerospace Research.  If not, see <http://www.gnu.org/licenses/>.
++
++   Serious thanks:		a.g., for tons of bugfixes and code-refactorings
++				stupid_chris, for the RealChuteLite implementation
++            			Taverius, for correcting a ton of incorrect values
++				Tetryds, for finding lots of bugs and issues and not letting me get away with them, and work on example crafts
++            			sarbian, for refactoring code for working with MechJeb, and the Module Manager updates
++            			ialdabaoth (who is awesome), who originally created Module Manager
++                        	Regex, for adding RPM support
++				DaMichel, for some ferramGraph updates and some control surface-related features
++            			Duxwing, for copy editing the readme
++
++   CompatibilityChecker by Majiir, BSD 2-clause http://opensource.org/licenses/BSD-2-Clause
++
++   Part.cfg changes powered by sarbian & ialdabaoth's ModuleManager plugin; used with permission
++	http://forum.kerbalspaceprogram.com/threads/55219
++
++   ModularFLightIntegrator by Sarbian, Starwaster and Ferram4, MIT: http://opensource.org/licenses/MIT
++	http://forum.kerbalspaceprogram.com/threads/118088
++
++   Toolbar integration powered by blizzy78's Toolbar plugin; used with permission
++	http://forum.kerbalspaceprogram.com/threads/60863
++ */
++
++using System;
++using System.Collections.Generic;
++using System.Threading;
++
++namespace FerramAerospaceResearch.FARThreading
++{
++    //This class only exists to ensure that the ThreadPool is not choked with requests to start running voxels, which will deadlock the entire voxelization process when the MaxThread limit is reached because they will be unable to start up their various worker threads
++    internal class VoxelizationThreadpool
++    {
++        private const int THREAD_COUNT = 8;
++
++        public static readonly VoxelizationThreadpool Instance = new VoxelizationThreadpool();
++
++        public static bool RunInMainThread = false;
++
++        private readonly Queue<Task> queuedMainThreadTasks;
++
++        private readonly Thread[] _threads;
++        private readonly Queue<Action> queuedVoxelizations;
++
++        private Thread _mainThread;
++
++        // Explicit static constructor to tell C# compiler not to mark type as beforefieldinit
++        static VoxelizationThreadpool()
++        {
++        }
++
++        private VoxelizationThreadpool()
++        {
++            _threads = new Thread[THREAD_COUNT];
++            queuedVoxelizations = new Queue<Action>();
++            queuedMainThreadTasks = new Queue<Task>();
++            for (int i = 0; i < _threads.Length; i++)
++            {
++                _threads[i] = new Thread(ExecuteQueuedVoxelization);
++                _threads[i].Start();
++            }
++
++            // make sure we get main thread while in main thread, ctor is not guaranteed to be run in main thread
++            queuedMainThreadTasks.Enqueue(new Task(SetupMainThread));
++        }
++
++        public bool inMainThread
++        {
++            get { return _mainThread == Thread.CurrentThread; }
++        }
++
++        ~VoxelizationThreadpool()
++        {
++            for (int i = 0; i < _threads.Length; i++)
++                //this will pass a null action to each thread, ending it
++                QueueVoxelization(null);
++        }
++
++        private void SetupMainThread()
++        {
++            _mainThread = Thread.CurrentThread;
++        }
++
++        private void ExecuteQueuedVoxelization()
++        {
++            while (true)
++            {
++                Action task;
++                lock (this)
++                {
++                    while (queuedVoxelizations.Count == 0)
++                        Monitor.Wait(this);
++
++                    task = queuedVoxelizations.Dequeue();
++                }
++
++                if (task != null)
++                    task();
++                else
++                    break;
++            }
++        }
++
++        public void QueueVoxelization(Action voxelAction)
++        {
++            lock (this)
++            {
++                queuedVoxelizations.Enqueue(voxelAction);
++                Monitor.Pulse(this);
++            }
++        }
++
++        public void RunOnMainThread(Action action)
++        {
++            if (inMainThread)
++            {
++                action();
++                return;
++            }
++
++            using (var resetEvent = new ManualResetEventSlim(false))
++            {
++                var task = new Task(() =>
++                {
++                    try
++                    {
++                        action();
++                    }
++                    finally
++                    {
++                        resetEvent.Set();
++                    }
++                });
++
++                lock (queuedMainThreadTasks)
++                {
++                    queuedMainThreadTasks.Enqueue(task);
++                }
++
++                resetEvent.Wait();
++            }
++        }
++
++        public void ExecuteMainThreadTasks()
++        {
++            while (true)
++            {
++                Task task;
++                lock (queuedMainThreadTasks)
++                {
++                    if (queuedMainThreadTasks.Count == 0)
++                        break;
++                    task = queuedMainThreadTasks.Dequeue();
++                }
++
++                task.Action();
++                task.Executed = true;
++            }
++        }
++
++        public class Task
++        {
++            public readonly Action Action;
++            public bool Executed;
++
++            public Task(Action action)
++            {
++                Action = action;
++                Executed = false;
++            }
++        }
++    }
++}
+diff --git a/FerramAerospaceResearch/FerramAerospaceResearch.csproj b/FerramAerospaceResearch/FerramAerospaceResearch.csproj
+index 3873eb2..5aecb8a 100644
+--- a/FerramAerospaceResearch/FerramAerospaceResearch.csproj
++++ b/FerramAerospaceResearch/FerramAerospaceResearch.csproj
+@@ -75,7 +75,19 @@
+     </Reference>
+     <Reference Include="System" />
+     <Reference Include="Unity.Mathematics">
+-      <HintPath>C:\Zaidimai\KSP 1.12\GameData\000_KSPBurst\Plugins\Unity.Mathematics.dll</HintPath>
++      <HintPath>$(KSP_DIR_BUILD)\GameData\000_KSPBurst\Plugins\Unity.Mathematics.dll</HintPath>
++    </Reference>
++    <Reference Include="Unity.Burst">
++      <HintPath>$(KSP_DIR_BUILD)\GameData\000_KSPBurst\Plugins\Unity.Burst.dll</HintPath>
++    </Reference>
++    <Reference Include="Unity.Jobs">
++      <HintPath>$(KSP_DIR_BUILD)\GameData\000_KSPBurst\Plugins\Unity.Jobs.dll</HintPath>
++    </Reference>
++    <Reference Include="Unity.Collections">
++      <HintPath>$(KSP_DIR_BUILD)\GameData\000_KSPBurst\Plugins\Unity.Collections.dll</HintPath>
++    </Reference>
++    <Reference Include="KSPBurst">
++      <HintPath>$(KSP_DIR_BUILD)\GameData\000_KSPBurst\Plugins\KSPBurst.dll</HintPath>
+     </Reference>
+     <Reference Include="UnityEngine, Version=0.0.0.0, Culture=neutral, processorArchitecture=MSIL">
+       <SpecificVersion>False</SpecificVersion>
+@@ -157,6 +169,7 @@
+     <Compile Include="FARAeroComponents\FARAeroPartModule.cs" />
+     <Compile Include="FARAeroComponents\FARAeroSection.cs" />
+     <Compile Include="FARAeroComponents\FARVesselAero.cs" />
++    <Compile Include="FARAeroComponents\FARVortexAero.cs" />
+     <Compile Include="FARAeroComponents\VehicleAerodynamics.cs" />
+     <Compile Include="FARAeroUtil.cs" />
+     <Compile Include="LEGACYferram4\FARBaseAerodynamics.cs" />
+@@ -189,6 +202,7 @@
+     <Compile Include="FARPartGeometry\GeometryModification\StockProcFairingGeoUpdater.cs" />
+     <Compile Include="FARPartGeometry\MeshData.cs" />
+     <Compile Include="FARPartGeometry\PartGeometryExtensions.cs" />
++    <Compile Include="FARPartGeometry\FARVoxelBurstJobs.cs" />
+     <Compile Include="FARPartGeometry\VehicleVoxel.cs" />
+     <Compile Include="FARPartGeometry\VoxelCrossSection.cs" />
+     <Compile Include="FARPartGeometry\VoxelChunk.cs" />
+diff --git a/FerramAerospaceResearch/LEGACYferram4/FARControllableSurface.cs b/FerramAerospaceResearch/LEGACYferram4/FARControllableSurface.cs
+index d44d262..4b1080a 100644
+--- a/FerramAerospaceResearch/LEGACYferram4/FARControllableSurface.cs
++++ b/FerramAerospaceResearch/LEGACYferram4/FARControllableSurface.cs
+@@ -220,6 +220,27 @@ namespace ferram4
+                        stepIncrement = 0.05f)]
+         public float minControl = 0.1f;
+ 
++        [KSPField(guiName = "Hinge Blowback", isPersistant = true, guiActiveEditor = true, guiActive = true),
++         UI_Toggle(affectSymCounterparts = UI_Scene.All, scene = UI_Scene.All, disabledText = "Off", enabledText = "On")]
++        public bool enableBlowback = true;
++
++        [KSPField(guiName = "Actuator Torque Limit", isPersistant = true, guiActiveEditor = true, guiActive = false),
++         UI_FloatRange(affectSymCounterparts = UI_Scene.All,
++                       maxValue = 50000f,
++                       minValue = 100f,
++                       scene = UI_Scene.Editor,
++                       stepIncrement = 100f)]
++        public float actuatorTorqueLimit = -1f; // -1 = auto-calculate based on part mass & surface area
++
++        [KSPField(isPersistant = false, guiActive = true, guiName = "Aero Hinge Torque")]
++        public string hingeTorqueDisplay = "0 N·m";
++
++        [KSPField(isPersistant = false, guiActive = true, guiName = "Control Blowback")]
++        public string blowbackDisplay = "100%";
++
++        protected double currentBlowbackRatio = 1.0;
++        protected double currentHingeTorqueNm = 0.0;
++
+         protected double PitchLocation;
+         protected double YawLocation;
+         protected double RollLocation;
+@@ -741,12 +762,78 @@ namespace ferram4
+         // Determines current deflection contributions from stick and flap/spoiler settings and update current total deflection (AoAoffset).
+         private void ChangeDeflection()
+         {
+-            if (!AoAcurrentControl.NearlyEqual(AoAdesiredControl))
+-                AoAcurrentControl = BlendDeflectionExp(AoAcurrentControl, AoAdesiredControl, timeConstant, justStarted);
++            double targetControl = AoAdesiredControl;
++            double targetFlap = AoAdesiredFlap;
++
++            // Apply aeroelastic blowback limit if enabled
++            if (enableBlowback && HighLogic.LoadedSceneIsFlight && vessel != null && vessel.atmDensity > 0.001)
++            {
++                double q = vessel.dynamicPressurekPa;
++                double surfArea = Math.Max(0.01, S * ctrlSurfFrac);
++                double surfChord = Math.Max(0.05, MAC_actual * ctrlSurfFrac);
++                Vector3d vel = GetVelocity();
++                double surfaceAoA = vel.sqrMagnitude > 1.0 ? base.CalculateAoA(vel) : 0.0;
++                double mach = vessel.mach;
++
++                // Derive max actuator stall torque:
++                // If user customized actuatorTorqueLimit (>0), use it;
++                // Otherwise auto-scale dynamically with part mass, surface area, and massMultiplier.
++                // Works seamlessly for ANY stock or modded part without hardcoding!
++                // Sized so that at high dynamic pressures (transonic dash / high-speed pull-up),
++                // realistic control stiffening and blowback occur naturally.
++                double maxTorque = actuatorTorqueLimit > 0
++                    ? actuatorTorqueLimit
++                    : Math.Max(150.0, (part.mass * 14000.0) + (surfArea * 700.0)) * Math.Max(0.5, massMultiplier);
++
++                targetControl = FerramAerospaceResearch.FARAeroComponents.FARVortexAero.CalculateBlowbackDeflection(
++                    targetControl,
++                    q,
++                    surfArea,
++                    surfChord,
++                    surfaceAoA,
++                    mach,
++                    maxTorque,
++                    out double ctrlBlowbackRatio);
++
++                targetFlap = FerramAerospaceResearch.FARAeroComponents.FARVortexAero.CalculateBlowbackDeflection(
++                    targetFlap,
++                    q,
++                    surfArea,
++                    surfChord,
++                    surfaceAoA,
++                    mach,
++                    maxTorque,
++                    out double flapBlowbackRatio);
++
++                currentBlowbackRatio = Math.Min(ctrlBlowbackRatio, flapBlowbackRatio);
++
++                double totalDesiredRad = (targetControl + targetFlap) * (Math.PI / 180.0);
++                currentHingeTorqueNm = FerramAerospaceResearch.FARAeroComponents.FARVortexAero.CalculateHingeMoment(
++                    q,
++                    surfArea,
++                    surfChord,
++                    surfaceAoA,
++                    totalDesiredRad,
++                    mach);
++
++                hingeTorqueDisplay = $"{currentHingeTorqueNm:F0} N·m";
++                blowbackDisplay = currentBlowbackRatio < 0.99
++                    ? $"{currentBlowbackRatio * 100:F0}% (Blowback)"
++                    : "100%";
++            }
++            else
++            {
++                currentBlowbackRatio = 1.0;
++                hingeTorqueDisplay = "0 N·m";
++                blowbackDisplay = "100%";
++            }
++
++            if (!AoAcurrentControl.NearlyEqual(targetControl))
++                AoAcurrentControl = BlendDeflectionExp(AoAcurrentControl, targetControl, timeConstant, justStarted);
+ 
+-            if (!AoAcurrentFlap.NearlyEqual(AoAdesiredFlap))
++            if (!AoAcurrentFlap.NearlyEqual(targetFlap))
+                 AoAcurrentFlap = BlendDeflectionLinear(AoAcurrentFlap,
+-                                                       AoAdesiredFlap,
++                                                       targetFlap,
+                                                        maxdeflectFlap,
+                                                        isSpoiler ? timeConstantSpoiler : timeConstantFlap,
+                                                        justStarted);
+diff --git a/FerramAerospaceResearch/LEGACYferram4/FARWingAerodynamicModel.cs b/FerramAerospaceResearch/LEGACYferram4/FARWingAerodynamicModel.cs
+index e296a4b..4da4f23 100644
+--- a/FerramAerospaceResearch/LEGACYferram4/FARWingAerodynamicModel.cs
++++ b/FerramAerospaceResearch/LEGACYferram4/FARWingAerodynamicModel.cs
+@@ -93,6 +93,28 @@ namespace ferram4
+         [KSPField(isPersistant = false, guiActive = true, guiName = "FARWingStalled")]
+         protected double stall;
+ 
++        [KSPField(isPersistant = true, guiActive = true, guiActiveEditor = true, guiName = "Aero Surface Type"),
++         UI_ChooseOption(scene = UI_Scene.Editor, options = new[] { "Auto Detect", "Force LERX/Strake", "Force Winglet", "Force Waverider", "Force Conventional" })]
++        public string strakeModeString = "Auto Detect";
++
++        [KSPField(isPersistant = false, guiActive = true, guiName = "Vortex Status")]
++        public string vortexStatus = "None";
++
++        [KSPField(isPersistant = false, guiActive = true, guiName = "Stall Delay")]
++        public string stallDelayDisplay = "0.0°";
++
++        [KSPField(isPersistant = false, guiActive = true, guiName = "Winglet Benefit")]
++        public string wingletBenefitDisplay = "None";
++
++        [KSPField(isPersistant = false, guiActive = true, guiName = "Shock State")]
++        public string shockStateDisplay = "None";
++
++        public bool IsStrake { get; private set; }
++        public bool IsWinglet { get; set; }
++        public bool IsWaverider { get; private set; }
++        public double VortexBurstFraction { get; private set; }
++        public double StallDelayBonus { get; set; }
++
+         private double minStall;
+ 
+         private double piARe = 1; //induced drag factor
+@@ -942,6 +964,7 @@ namespace ferram4
+                                                            ref ACweight,
+                                                            ref ACshift,
+                                                            ref ClIncrementFromRear);
++            StallDelayBonus = wingInteraction.EffectiveStallDelayBonus;
+             double effectiveUpstreamInfluence = wingInteraction.EffectiveUpstreamInfluence;
+ 
+             if (effectiveUpstreamInfluence > 0)
+@@ -994,8 +1017,61 @@ namespace ferram4
+             stall = stall.Clamp(0, 1);
+             if (stall < 1e-5)
+                 stall = 0;
++
++            // Coherent LERX / strake maintains vortex suction instead of conventional 2D separation
++            if (IsStrake && VortexBurstFraction < 0.5)
++            {
++                stall = Math.Min(stall, VortexBurstFraction);
++            }
+         }
+ 
++        private void UpdateStrakeStatus()
++        {
++            FerramAerospaceResearch.FARAeroComponents.FARVortexAero.StrakeMode mode =
++                FerramAerospaceResearch.FARAeroComponents.FARVortexAero.StrakeMode.Auto;
++            if (strakeModeString == "Force LERX/Strake")
++                mode = FerramAerospaceResearch.FARAeroComponents.FARVortexAero.StrakeMode.ForceLERX;
++            else if (strakeModeString == "Force Winglet")
++                mode = FerramAerospaceResearch.FARAeroComponents.FARVortexAero.StrakeMode.ForceWinglet;
++            else if (strakeModeString == "Force Waverider")
++                mode = FerramAerospaceResearch.FARAeroComponents.FARVortexAero.StrakeMode.ForceWaverider;
++            else if (strakeModeString == "Force Conventional")
++                mode = FerramAerospaceResearch.FARAeroComponents.FARVortexAero.StrakeMode.ForceConventional;
++
++            double sweepRad = Math.Acos(cosSweepAngle.Clamp(0.0, 1.0));
++            double sweepDeg = sweepRad * (180.0 / Math.PI);
++            double ar = transformed_AR > 0.05 ? transformed_AR : (2.0 * b_2_actual / Math.Max(0.05, MAC_actual));
++
++            if (mode == FerramAerospaceResearch.FARAeroComponents.FARVortexAero.StrakeMode.ForceLERX)
++            {
++                IsStrake = true;
++                IsWinglet = false;
++                IsWaverider = false;
++            }
++            else if (mode == FerramAerospaceResearch.FARAeroComponents.FARVortexAero.StrakeMode.ForceWinglet)
++            {
++                IsStrake = false;
++                IsWinglet = true;
++                IsWaverider = false;
++            }
++            else if (mode == FerramAerospaceResearch.FARAeroComponents.FARVortexAero.StrakeMode.ForceWaverider)
++            {
++                IsStrake = false;
++                IsWinglet = false;
++                IsWaverider = true;
++            }
++            else if (mode == FerramAerospaceResearch.FARAeroComponents.FARVortexAero.StrakeMode.ForceConventional)
++            {
++                IsStrake = false;
++                IsWinglet = false;
++                IsWaverider = false;
++            }
++            else
++            {
++                IsStrake = FerramAerospaceResearch.FARAeroComponents.FARVortexAero.IsGeometricStrake(ar, sweepDeg);
++                IsWaverider = FerramAerospaceResearch.FARAeroComponents.FARVortexAero.IsGeometricWaverider(ar, sweepDeg);
++            }
++        }
+ 
+         /// <summary>
+         ///     This calculates the lift and drag coefficients
+@@ -1006,6 +1082,7 @@ namespace ferram4
+ 
+             rawLiftSlope = CalculateSubsonicLiftSlope(MachNumber); // / AoA;     //Prandtl lifting Line
+ 
++            UpdateStrakeStatus();
+ 
+             CalculateWingCamberInteractions(MachNumber, AoA, out double ACshift, out double ACweight);
+             DetermineStall(AoA);
+@@ -1021,13 +1098,47 @@ namespace ferram4
+             double Cd0 = CdCompressibilityZeroLiftIncrement(MachNumber, cosSweepAngle, TanSweep, beta_TanSweep, beta) +
+                          2 * skinFrictionCoefficient;
+             double CdMax = CdMaxFlatPlate(MachNumber, beta);
+-            e = FARAeroUtil.CalculateOswaldsEfficiencyNitaScholz(effective_AR, cosSweepAngle, Cd0, TaperRatio);
+-            piARe = effective_AR * e * Math.PI;
++
++            // Apply winglet vortex diffusion benefits: boosted effective AR and Oswald efficiency
++            double wingletArMult = (wingInteraction != null) ? wingInteraction.WingletARMultiplier : 1.0;
++            double wingletEMult = (wingInteraction != null) ? wingInteraction.WingletEfficiencyMultiplier : 1.0;
++
++            double wingletBoostedAR = (effective_AR * wingletArMult).Clamp(0.25, 35d);
++            e = FARAeroUtil.CalculateOswaldsEfficiencyNitaScholz(wingletBoostedAR, cosSweepAngle, Cd0, TaperRatio);
++            e *= wingletEMult;
++            piARe = wingletBoostedAR * e * Math.PI;
+ 
+             double CosAoA = Math.Cos(AoA);
+ 
+-            if (MachNumber <= 0.8)
++            if (IsStrake && MachNumber <= 1.2)
+             {
++                double sweepRad = Math.Acos(cosSweepAngle.Clamp(0.0, 1.0));
++                double ar = transformed_AR > 0.05 ? transformed_AR : (2.0 * b_2_actual / Math.Max(0.05, MAC_actual));
++
++                FerramAerospaceResearch.FARAeroComponents.FARVortexAero.CalculateStrakeAero(
++                    AoA,
++                    MachNumber,
++                    ar,
++                    sweepRad,
++                    out double strakeCl,
++                    out double strakeCdi,
++                    out double burstFrac,
++                    out double acShiftFrac);
++
++                VortexBurstFraction = burstFrac;
++                vortexStatus = burstFrac > 0.05 ? $"Bursting ({burstFrac * 100:F0}%)" : "Vortex Coherent";
++
++                Cl = strakeCl;
++                Cd = strakeCdi + Cd0;
++                FinalLiftSlope = Math.Abs(Cl / Math.Max(1e-4, Math.Sin(AoA)));
++
++                if (acShiftFrac > 0.0)
++                    ACshift += acShiftFrac * MAC_actual;
++            }
++            else if (MachNumber <= 0.8)
++            {
++                vortexStatus = "Conventional";
++                VortexBurstFraction = 0.0;
+                 double Cn = liftslope;
+                 FinalLiftSlope = liftslope;
+                 double sinAoA = Math.Sqrt((1 - CosAoA * CosAoA).Clamp(0, 1));
+@@ -1047,17 +1158,41 @@ namespace ferram4
+              */
+             else if (MachNumber > 1.4)
+             {
+-                double coefMult = 2 / (FARAeroUtil.CurrentAdiabaticIndex * MachNumber * MachNumber);
++                double sweepRad = Math.Acos(cosSweepAngle.Clamp(0.0, 1.0));
+ 
+-                double supersonicLENormalForceFactor = CalculateSupersonicLEFactor(beta, TanSweep, beta_TanSweep);
++                if (IsWaverider && MachNumber >= 1.8)
++                {
++                    FerramAerospaceResearch.FARAeroComponents.FARVortexAero.CalculateWaveriderHypersonicAero(
++                        AoA,
++                        MachNumber,
++                        sweepRad,
++                        out double clWave,
++                        out double cdWave,
++                        out bool shockAttached);
++
++                    double waveLD = Math.Abs(clWave / Math.Max(1e-4, cdWave + Cd0));
++                    shockStateDisplay = shockAttached
++                        ? $"Attached (L/D: {waveLD:F1})"
++                        : "Detached (Spillage)";
++                    Cl = clWave;
++                    Cd = cdWave + Cd0;
++                    FinalLiftSlope = Math.Abs(Cl / Math.Max(1e-4, Math.Sin(AoA)));
++                }
++                else
++                {
++                    shockStateDisplay = MachNumber >= 1.8 ? "Conventional Supersonic" : "None";
++                    double coefMult = 2 / (FARAeroUtil.CurrentAdiabaticIndex * MachNumber * MachNumber);
+ 
+-                double normalForce = GetSupersonicPressureDifference(MachNumber, AoA);
+-                FinalLiftSlope = coefMult * normalForce * supersonicLENormalForceFactor;
++                    double supersonicLENormalForceFactor = CalculateSupersonicLEFactor(beta, TanSweep, beta_TanSweep);
+ 
+-                Cl = FinalLiftSlope * CosAoA * Math.Sign(AoA);
+-                Cd = beta * Cl * Cl / piARe;
++                    double normalForce = GetSupersonicPressureDifference(MachNumber, AoA);
++                    FinalLiftSlope = coefMult * normalForce * supersonicLENormalForceFactor;
+ 
+-                Cd += Cd0;
++                    Cl = FinalLiftSlope * CosAoA * Math.Sign(AoA);
++                    Cd = beta * Cl * Cl / piARe;
++
++                    Cd += Cd0;
++                }
+             }
+             /*
+              * Transonic nonlinear lift / drag code
+@@ -1127,6 +1262,40 @@ namespace ferram4
+             Cd += Cd * stall * 3;
+             Cd = Math.Max(Cd, CdMax * (1 - CosAoA * CosAoA));
+ 
++            // Ground Effect (Wieselsberger mirror vortex model)
++            if (HighLogic.LoadedSceneIsFlight && vessel != null)
++            {
++                double alt = vessel.radarAltitude;
++                double span = Math.Max(b_2_actual * 2.0, 2.0);
++                FerramAerospaceResearch.FARAeroComponents.FARVortexAero.CalculateGroundEffect(
++                    alt, span, out double geDragFactor, out double geLiftMult);
++                if (geDragFactor < 0.999)
++                {
++                    Cd = (Cd - Cd0) * geDragFactor + Cd0;
++                    Cl *= geLiftMult;
++                }
++            }
++
++            if (StallDelayBonus > 0.001)
++                stallDelayDisplay = $"+{StallDelayBonus * (180.0 / Math.PI):F1}° (LERX Active)";
++            else
++                stallDelayDisplay = "0.0°";
++
++            if (IsWinglet)
++            {
++                wingletBenefitDisplay = "Winglet (Diffusing Tip Vortex)";
++            }
++            else if (wingInteraction != null && wingInteraction.WingletARMultiplier > 1.001)
++            {
++                double arBoostPct = (wingInteraction.WingletARMultiplier - 1.0) * 100.0;
++                double dragCutPct = (1.0 - 1.0 / (wingInteraction.WingletARMultiplier * wingInteraction.WingletEfficiencyMultiplier)) * 100.0;
++                wingletBenefitDisplay = $"+{arBoostPct:F1}% AR (-{dragCutPct:F0}% Cdi)";
++            }
++            else
++            {
++                wingletBenefitDisplay = "None";
++            }
++
+             AerodynamicCenter += ACShiftVec;
+ 
+             Cl *= wingInteraction.ClInterferenceFactor;
+@@ -1286,6 +1455,7 @@ namespace ferram4
+                              tmp;
+             }
+ 
++            StallAngle += StallDelayBonus;
+             return StallAngle;
+         }
+ 
+diff --git a/FerramAerospaceResearch/LEGACYferram4/FARWingInteraction.cs b/FerramAerospaceResearch/LEGACYferram4/FARWingInteraction.cs
+index 70a8226..3be6d64 100644
+--- a/FerramAerospaceResearch/LEGACYferram4/FARWingInteraction.cs
++++ b/FerramAerospaceResearch/LEGACYferram4/FARWingInteraction.cs
+@@ -137,6 +137,9 @@ namespace ferram4
+         public double EffectiveUpstreamAoA { get; private set; }
+         public double EffectiveUpstreamCd0 { get; private set; }
+         public double EffectiveUpstreamInfluence { get; private set; }
++        public double EffectiveStallDelayBonus { get; private set; }
++        public double WingletARMultiplier { get; private set; } = 1.0;
++        public double WingletEfficiencyMultiplier { get; private set; } = 1.0;
+         public bool HasWingsUpstream { get; private set; }
+ 
+         public double ARFactor { get; private set; } = 1;
+@@ -166,6 +169,7 @@ namespace ferram4
+             EffectiveUpstreamAoA = 0;
+             EffectiveUpstreamCd0 = 0;
+             EffectiveUpstreamInfluence = 0;
++            EffectiveStallDelayBonus = 0;
+         }
+ 
+         /// <summary>
+@@ -262,6 +266,70 @@ namespace ferram4
+             ClCdInterference += 0.5f * WingInterference(-forward, VesselPartList, flt_b_2);
+ 
+             ClInterferenceFactor = ClCdInterference;
++
++            DetectAndApplyWingletInteractions();
++        }
++
++        private void DetectAndApplyWingletInteractions()
++        {
++            WingletARMultiplier = 1.0;
++            WingletEfficiencyMultiplier = 1.0;
++
++            if (parentWingPart == null || parentWingModule == null)
++                return;
++
++            // Check spanwise adjacent wing modules (leftward and rightward)
++            List<FARWingAerodynamicModel> spanwiseModules = new List<FARWingAerodynamicModel>();
++            if (nearbyWingModulesLeftwardList != null)
++                spanwiseModules.AddRange(nearbyWingModulesLeftwardList);
++            if (nearbyWingModulesRightwardList != null)
++                spanwiseModules.AddRange(nearbyWingModulesRightwardList);
++
++            // Also check child parts directly attached at the wing tip
++            foreach (Part child in parentWingPart.children)
++            {
++                if (child == null) continue;
++                FARWingAerodynamicModel childWing = child.GetComponent<FARWingAerodynamicModel>();
++                if (childWing != null && !spanwiseModules.Contains(childWing))
++                    spanwiseModules.Add(childWing);
++            }
++
++            Vector3 parentNormal = parentWingPart.partTransform.forward;
++            double parentSpan = Math.Max(0.5, parentWingModule.b_2_actual * 2.0);
++
++            foreach (FARWingAerodynamicModel winglet in spanwiseModules)
++            {
++                if (winglet == null || winglet == parentWingModule || winglet.part == null)
++                    continue;
++
++                Vector3 wingletNormal = winglet.part.partTransform.forward;
++                double dotNormals = Vector3.Dot(parentNormal, wingletNormal);
++                dotNormals = Math.Max(-1.0, Math.Min(1.0, dotNormals));
++                double dihedralAngleRad = Math.Acos(Math.Abs(dotNormals));
++                double dihedralAngleDeg = dihedralAngleRad * (180.0 / Math.PI);
++
++                double wingletHeight = Math.Max(winglet.b_2_actual, winglet.MAC_actual);
++
++                bool isWinglet = winglet.IsWinglet ||
++                                 FerramAerospaceResearch.FARAeroComponents.FARVortexAero.IsGeometricWinglet(
++                                     dihedralAngleDeg, wingletHeight, parentSpan);
++
++                if (isWinglet)
++                {
++                    winglet.IsWinglet = true;
++                    FerramAerospaceResearch.FARAeroComponents.FARVortexAero.CalculateWingletEffect(
++                        wingletHeight,
++                        parentSpan,
++                        dihedralAngleRad,
++                        out double arMult,
++                        out double eMult);
++
++                    if (arMult > WingletARMultiplier)
++                        WingletARMultiplier = arMult;
++                    if (eMult > WingletEfficiencyMultiplier)
++                        WingletEfficiencyMultiplier = eMult;
++                }
++            }
+         }
+ 
+         //This updates the interactions of all wings near this one; call this one when something changes rather than all of them at once
+@@ -644,6 +712,7 @@ namespace ferram4
+             EffectiveUpstreamAoA = 0;
+             EffectiveUpstreamCd0 = 0;
+             EffectiveUpstreamInfluence = 0;
++            EffectiveStallDelayBonus = 0;
+ 
+             double wingForwardDir = parallelInPlaneLocal.y;
+             double wingRightwardDir = parallelInPlaneLocal.x * srfAttachFlipped;
+@@ -765,6 +834,18 @@ namespace ferram4
+                 EffectiveUpstreamCd0 += wingModule.GetCd0() * wingInfluenceFactor;
+                 EffectiveUpstreamInfluence += wingInfluenceFactor;
+ 
++                if (wingModule.IsStrake)
++                {
++                    double delay = FerramAerospaceResearch.FARAeroComponents.FARVortexAero.CalculateStallDelay(
++                        wingModule.S,
++                        parentWingModule.S,
++                        wingInfluenceFactor,
++                        wingModule.VortexBurstFraction
++                    );
++                    if (delay > EffectiveStallDelayBonus)
++                        EffectiveStallDelayBonus = delay;
++                }
++
+                 double wAoA = wingModule.CalculateAoA(wingModule.GetVelocity()) * Math.Sign(tmp);
+                 //First, make sure that the AoA are wrt the same direction; then account for any strange angling of the part that shouldn't be there
+                 tmp = (thisWingAoA - wAoA) * wingInfluenceFactor;
+diff --git a/GameData/FerramAerospaceResearch/Plugins/FerramAerospaceResearch.Base.dll b/GameData/FerramAerospaceResearch/Plugins/FerramAerospaceResearch.Base.dll
+index 89299de..55254ba 100644
+Binary files a/GameData/FerramAerospaceResearch/Plugins/FerramAerospaceResearch.Base.dll and b/GameData/FerramAerospaceResearch/Plugins/FerramAerospaceResearch.Base.dll differ
+diff --git a/GameData/FerramAerospaceResearch/Plugins/FerramAerospaceResearch.dll b/GameData/FerramAerospaceResearch/Plugins/FerramAerospaceResearch.dll
+index b3e69c6..c304f9d 100644
+Binary files a/GameData/FerramAerospaceResearch/Plugins/FerramAerospaceResearch.dll and b/GameData/FerramAerospaceResearch/Plugins/FerramAerospaceResearch.dll differ
+diff --git a/GameData/FerramAerospaceResearch/Plugins/ferramGraph.dll b/GameData/FerramAerospaceResearch/Plugins/ferramGraph.dll
+index 78f7d1e..c00965d 100644
+Binary files a/GameData/FerramAerospaceResearch/Plugins/ferramGraph.dll and b/GameData/FerramAerospaceResearch/Plugins/ferramGraph.dll differ
+diff --git a/config.json b/config.json
+index 5857388..f154c48 100644
+--- a/config.json
++++ b/config.json
+@@ -7,7 +7,7 @@
+         "ModDir": "$(SolutionDir)/$(ModDirRelative)",
+         "PluginDir": "$(ModDir)/Plugins",
+         "AssetDir": "$(ModDir)/Assets",
+-        "KSP_DIR_INSTALL": "C:/Zaidimai/KSP 1.12",
++        "KSP_DIR_INSTALL": "/home/charlie/.local/share/Steam/steamapps/common/Kerbal Space Program",
+         "KSPGameData": "$(KSP_DIR_INSTALL)/GameData",
+         "GameDir": "$(KSPGameData)/$(ModName)",
+         "VersionMajor": 0,
+diff --git a/tests/FARVortexAeroTests/FARVortexAeroTests.csproj b/tests/FARVortexAeroTests/FARVortexAeroTests.csproj
+new file mode 100644
+index 0000000..aabd26d
+--- /dev/null
++++ b/tests/FARVortexAeroTests/FARVortexAeroTests.csproj
+@@ -0,0 +1,18 @@
++<Project Sdk="Microsoft.NET.Sdk">
++
++  <PropertyGroup>
++    <OutputType>Exe</OutputType>
++    <TargetFramework>net10.0</TargetFramework>
++    <ImplicitUsings>enable</ImplicitUsings>
++    <Nullable>enable</Nullable>
++  </PropertyGroup>
++
++  <ItemGroup>
++    <Compile Include="..\..\FerramAerospaceResearch\FARAeroComponents\FARVortexAero.cs" Link="FARVortexAero.cs" />
++  </ItemGroup>
++
++  <ItemGroup>
++    <!-- Minimal dummy UnityEngine definitions if needed, or define in test harness -->
++  </ItemGroup>
++
++</Project>
+diff --git a/tests/FARVortexAeroTests/Program.cs b/tests/FARVortexAeroTests/Program.cs
+new file mode 100644
+index 0000000..b9d18f0
+--- /dev/null
++++ b/tests/FARVortexAeroTests/Program.cs
+@@ -0,0 +1,194 @@
++using System;
++using FerramAerospaceResearch.FARAeroComponents;
++
++namespace FARVortexAeroTests
++{
++    class Program
++    {
++        static int Main(string[] args)
++        {
++            Console.WriteLine("==================================================");
++            Console.WriteLine("Running FAR-Next Aerodynamics Test Suite");
++            Console.WriteLine("==================================================");
++
++            int failures = 0;
++
++            void Assert(bool condition, string testName, string details = "")
++            {
++                if (condition)
++                {
++                    Console.WriteLine($"[PASS] {testName}");
++                }
++                else
++                {
++                    Console.ForegroundColor = ConsoleColor.Red;
++                    Console.WriteLine($"[FAIL] {testName} - {details}");
++                    Console.ResetColor();
++                    failures++;
++                }
++            }
++
++            // Test 1: Geometric Strake Detection
++            Console.WriteLine("\n--- Testing Geometric Strake Heuristics ---");
++            Assert(FARVortexAero.IsGeometricStrake(1.2, 65.0), "Low AR (1.2) + High Sweep (65°) detected as Strake");
++            Assert(FARVortexAero.IsGeometricStrake(0.8, 70.0), "Very low AR (0.8) + 70° detected as Strake");
++            Assert(!FARVortexAero.IsGeometricStrake(4.5, 25.0), "High AR (4.5) + Low Sweep (25°) rejected (Conventional Wing)");
++            Assert(!FARVortexAero.IsGeometricStrake(3.0, 60.0), "High AR (3.0) with High Sweep rejected (Aspect ratio too high)");
++            Assert(!FARVortexAero.IsGeometricStrake(1.0, 30.0), "Low AR (1.0) with low sweep (30°) rejected (Sweep too low)");
++
++            // Test 2: Polhamus Kv Factor
++            Console.WriteLine("\n--- Testing Polhamus Suction Factors ---");
++            double kv60 = FARVortexAero.CalculateKv(60.0 * Math.PI / 180.0, 0.3);
++            double kv75 = FARVortexAero.CalculateKv(75.0 * Math.PI / 180.0, 0.3);
++            Assert(kv60 > 1.2 && kv60 < 2.5, "Kv for 60° sweep in expected range", $"Got {kv60:F3}");
++            Assert(kv75 > 0.5 && kv75 < kv60, "Kv for 75° sweep is less than 60° (slender leading edge suction projection)", $"Got {kv75:F3}");
++
++            // Test 3: Non-linear Vortex Lift Growth at Moderate-to-High Alpha
++            Console.WriteLine("\n--- Testing Lift Polar Curves (Polhamus Analogy) ---");
++            double sweep65Rad = 65.0 * Math.PI / 180.0;
++            double arStrake = 1.2;
++
++            FARVortexAero.CalculateStrakeAero(10.0 * Math.PI / 180.0, 0.3, arStrake, sweep65Rad,
++                out double cl10, out double cd10, out double burst10, out _);
++            FARVortexAero.CalculateStrakeAero(25.0 * Math.PI / 180.0, 0.3, arStrake, sweep65Rad,
++                out double cl25, out double cd25, out double burst25, out _);
++            FARVortexAero.CalculateStrakeAero(35.0 * Math.PI / 180.0, 0.3, arStrake, sweep65Rad,
++                out double cl35, out double cd35, out double burst35, out _);
++
++            Assert(cl25 > cl10 * 2.2, "Non-linear vortex lift superimposition at 25° AoA", $"cl10={cl10:F3}, cl25={cl25:F3}");
++            Assert(cl35 > cl25, "Lift continues increasing up to 35° AoA (pre-burst)", $"cl25={cl25:F3}, cl35={cl35:F3}");
++            Assert(burst10 == 0.0, "Vortex is fully coherent at 10° AoA", $"burst10={burst10}");
++            Assert(burst25 == 0.0, "Vortex is fully coherent at 25° AoA", $"burst25={burst25}");
++
++            // Test 4: Vortex Bursting at Extreme Alpha
++            Console.WriteLine("\n--- Testing Vortex Breakdown & Burst Dynamics ---");
++            double burstAoA = FARVortexAero.CalculateBurstAoA(sweep65Rad, 0.3);
++            double burstAoADeg = burstAoA * (180.0 / Math.PI);
++            Assert(burstAoADeg >= 35.0 && burstAoADeg <= 45.0, "Critical burst AoA is realistic (~40°)", $"Got {burstAoADeg:F1}°");
++
++            FARVortexAero.CalculateStrakeAero(50.0 * Math.PI / 180.0, 0.3, arStrake, sweep65Rad,
++                out double cl50, out double cd50, out double burst50, out double acShift50);
++
++            Assert(burst50 > 0.5, "Vortex undergoes breakdown past burst angle (50° AoA)", $"burst50={burst50:F2}");
++            Assert(acShift50 > 0.0, "Burst causes positive (pitch-up) AC shift due to rear suction collapse", $"acShift50={acShift50:F3}");
++            Assert(cd50 > cd25 * 3.0, "Drag jumps dramatically post-burst due to separated flow", $"cd25={cd25:F3}, cd50={cd50:F3}");
++
++            // Test 5: Boundary Layer Energization (Stall Delay on Main Wing)
++            Console.WriteLine("\n--- Testing Downstream Stall Delay ---");
++            double stallDelay = FARVortexAero.CalculateStallDelay(
++                strakeArea: 3.5,
++                mainWingArea: 15.0,
++                alignmentFactor: 0.9,
++                strakeBurstFraction: 0.0
++            );
++            double stallDelayDeg = stallDelay * (180.0 / Math.PI);
++            Assert(stallDelayDeg >= 5.0 && stallDelayDeg <= 16.0, "Strake provides +5° to +16° stall delay to main wing", $"Got +{stallDelayDeg:F2}°");
++
++            double burstStallDelay = FARVortexAero.CalculateStallDelay(
++                strakeArea: 3.5,
++                mainWingArea: 15.0,
++                alignmentFactor: 0.9,
++                strakeBurstFraction: 1.0
++            );
++            Assert(burstStallDelay == 0.0, "Stall delay bonus collapses when strake vortex bursts", $"Got {burstStallDelay}");
++
++            // Test 6: Ground Effect
++            Console.WriteLine("\n--- Testing Ground Effect Equations ---");
++            FARVortexAero.CalculateGroundEffect(altitudeAboveGround: 2.0, wingSpan: 12.0,
++                out double dragFactorNear, out double liftSlopeNear);
++            FARVortexAero.CalculateGroundEffect(altitudeAboveGround: 30.0, wingSpan: 12.0,
++                out double dragFactorHigh, out double liftSlopeHigh);
++
++            Assert(dragFactorNear < 0.6, "Induced drag is slashed near ground (h/b = 0.16)", $"Got dragFactor={dragFactorNear:F3}");
++            Assert(liftSlopeNear > 1.05, "Lift slope is boosted near ground", $"Got liftSlopeMultiplier={liftSlopeNear:F3}");
++            Assert(Math.Abs(dragFactorHigh - 1.0) < 1e-4, "Induced drag returns to 100% in free flight (h/b > 1.5)", $"Got {dragFactorHigh}");
++
++            // Test 7: Winglet Whitcomb Effect & Induced Drag Reduction
++            Console.WriteLine("\n--- Testing Winglet Induced Drag Reduction (Whitcomb Model) ---");
++            double mainSpan = 14.0;
++            double wingletHeight = 1.4; // h/b = 0.10
++            double cant90Rad = 90.0 * Math.PI / 180.0;
++            double cant60Rad = 60.0 * Math.PI / 180.0;
++
++            Assert(FARVortexAero.IsGeometricWinglet(85.0, wingletHeight, mainSpan), "Vertical wingtip fin detected as Winglet");
++            Assert(FARVortexAero.IsGeometricWinglet(55.0, wingletHeight, mainSpan), "Canted 55° winglet detected as Winglet");
++            Assert(!FARVortexAero.IsGeometricWinglet(10.0, wingletHeight, mainSpan), "Flat extension (10° dihedral) rejected (Conventional wing)");
++            Assert(!FARVortexAero.IsGeometricWinglet(85.0, 10.0, mainSpan), "Massive fin (h/b > 0.45) rejected as Winglet");
++
++            FARVortexAero.CalculateWingletEffect(wingletHeight, mainSpan, cant90Rad, out double arMult90, out double eMult90);
++            FARVortexAero.CalculateWingletEffect(wingletHeight, mainSpan, cant60Rad, out double arMult60, out double eMult60);
++
++            Assert(arMult90 >= 1.15 && arMult90 <= 1.25, "90° Winglet provides +15% to +25% effective AR boost", $"Got arMult={arMult90:F3}");
++            Assert(eMult90 >= 1.05 && eMult90 <= 1.15, "90° Winglet provides +5% to +15% Oswald efficiency boost", $"Got eMult={eMult90:F3}");
++            Assert(arMult90 > arMult60, "Vertical winglet provides higher vortex diffusion than lower cant", $"arMult90={arMult90:F3}, arMult60={arMult60:F3}");
++
++            // Induced drag comparison: Cdi = Cl^2 / (pi * AR * e)
++            double baseAr = 7.0;
++            double baseE = 0.80;
++            double baseDenom = baseAr * baseE;
++            double wingletDenom = (baseAr * arMult90) * (baseE * eMult90);
++            double cdiReductionFraction = 1.0 - (baseDenom / wingletDenom);
++            Assert(cdiReductionFraction >= 0.18 && cdiReductionFraction <= 0.30, "Winglet cuts induced drag by 18% to 30%", $"Got -{cdiReductionFraction * 100:F1}%");
++
++            Console.WriteLine("\n--- Testing Aeroelastic Control Blowback & Hinge Moments ---");
++            // Low dynamic pressure (slow flight, 50 m/s, q ~ 1.5 kPa): full deflection easily achieved
++            double lowQ = 1.5;
++            double surfArea = 0.5; // 0.5 m^2
++            double surfChord = 0.3; // 0.3 m
++            double lowMach = 0.15;
++            double stallTorque = 1500.0; // 1500 N*m actuator capacity
++            double defl1 = FARVortexAero.CalculateBlowbackDeflection(20.0, lowQ, surfArea, surfChord, 0.05, lowMach, stallTorque, out double blowback1);
++            Assert(blowback1 > 0.999 && Math.Abs(defl1 - 20.0) < 0.01, "Low dynamic pressure allows full 20° deflection", $"Got {defl1:F1}°, ratio={blowback1:F2}");
++
++            // High dynamic pressure dive / supersonic dash (q = 80 kPa, Mach 1.5): massive hinge moment causes blowback
++            double highQ = 80.0;
++            double highMach = 1.5;
++            double highStallTorque = 600.0; // 600 N*m realistic actuator capacity for light surface
++            double defl2 = FARVortexAero.CalculateBlowbackDeflection(20.0, highQ, surfArea, surfChord, 0.05, highMach, highStallTorque, out double blowback2);
++            Assert(blowback2 < 0.5, "High-q supersonic flight blows back deflection to < 50%", $"Got {defl2:F1}°, ratio={blowback2:F2}");
++            Assert(defl2 < 10.0 && defl2 > 1.0, "Effective deflection is realistically constrained", $"Got {defl2:F1}°");
++
++            double hingeNm = FARVortexAero.CalculateHingeMoment(highQ, surfArea, surfChord, 0.05, 20.0 * Math.PI / 180.0, highMach);
++            Assert(hingeNm > highStallTorque, "High-q commanded hinge moment exceeds available actuator torque", $"Hinge torque = {hingeNm:F0} N*m vs Stall = {highStallTorque} N*m");
++
++            Console.WriteLine("\n--- Testing Waverider Hypersonic Compression Lift ---");
++            // Test geometry heuristics
++            Assert(FARVortexAero.IsGeometricWaverider(1.2, 70.0), "High sweep (70°) + low AR (1.2) detected as Waverider", "Expected true");
++            Assert(!FARVortexAero.IsGeometricWaverider(4.0, 30.0), "Low sweep (30°) + high AR (4.0) rejected as Waverider", "Expected false");
++
++            // Test Mach 6 hypersonic compression lift
++            double testMach = 6.0;
++            double testSweepRad = 68.0 * (Math.PI / 180.0);
++            double testAoA = 6.0 * (Math.PI / 180.0); // 6 deg trim AoA
++            FARVortexAero.CalculateWaveriderHypersonicAero(testAoA, testMach, testSweepRad, out double clWave, out double cdWave, out bool shockAttached);
++
++            Assert(shockAttached, "Shock attaches along sharp swept leading edge at Mach 6", "Expected shockAttached = true");
++            Assert(clWave > 0.05, "Compression lift generated under lower surface", $"Got Cl = {clWave:F4}");
++            double ldRatio = clWave / Math.Max(1e-4, cdWave);
++            Assert(ldRatio >= 4.0 && ldRatio <= 8.5, "Waverider compression lift yields superior L/D (4.0 to 8.5)", $"Got L/D = {ldRatio:F2}");
++
++            // Test extreme high AoA shock detachment
++            double highAoA = 50.0 * (Math.PI / 180.0); // 50 deg AoA exceeds theta_max
++            FARVortexAero.CalculateWaveriderHypersonicAero(highAoA, testMach, testSweepRad, out double clDetached, out double cdDetached, out bool shockAttachedHigh);
++            Assert(!shockAttachedHigh, "Shock detaches when AoA exceeds maximum wedge shock angle", "Expected shockAttached = false");
++            double ldDetached = clDetached / Math.Max(1e-4, cdDetached);
++            Assert(ldDetached < 1.5, "Detached shock degrades into high-drag blunt flow (L/D < 1.5)", $"Got L/D = {ldDetached:F2}");
++
++            Console.WriteLine("\n==================================================");
++            if (failures == 0)
++            {
++                Console.ForegroundColor = ConsoleColor.Green;
++                Console.WriteLine("ALL TESTS PASSED!");
++                Console.ResetColor();
++                return 0;
++            }
++            else
++            {
++                Console.ForegroundColor = ConsoleColor.Red;
++                Console.WriteLine($"{failures} TESTS FAILED!");
++                Console.ResetColor();
++                return 1;
++            }
++        }
++    }
++}

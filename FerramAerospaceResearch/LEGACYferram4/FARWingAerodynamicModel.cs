@@ -93,6 +93,28 @@ namespace ferram4
         [KSPField(isPersistant = false, guiActive = true, guiName = "FARWingStalled")]
         protected double stall;
 
+        [KSPField(isPersistant = true, guiActive = true, guiActiveEditor = true, guiName = "Aero Surface Type"),
+         UI_ChooseOption(scene = UI_Scene.Editor, options = new[] { "Auto Detect", "Force LERX/Strake", "Force Winglet", "Force Waverider", "Force Conventional" })]
+        public string strakeModeString = "Auto Detect";
+
+        [KSPField(isPersistant = false, guiActive = true, guiName = "Vortex Status")]
+        public string vortexStatus = "None";
+
+        [KSPField(isPersistant = false, guiActive = true, guiName = "Stall Delay")]
+        public string stallDelayDisplay = "0.0°";
+
+        [KSPField(isPersistant = false, guiActive = true, guiName = "Winglet Benefit")]
+        public string wingletBenefitDisplay = "None";
+
+        [KSPField(isPersistant = false, guiActive = true, guiName = "Shock State")]
+        public string shockStateDisplay = "None";
+
+        public bool IsStrake { get; private set; }
+        public bool IsWinglet { get; set; }
+        public bool IsWaverider { get; private set; }
+        public double VortexBurstFraction { get; private set; }
+        public double StallDelayBonus { get; set; }
+
         private double minStall;
 
         private double piARe = 1; //induced drag factor
@@ -942,6 +964,7 @@ namespace ferram4
                                                            ref ACweight,
                                                            ref ACshift,
                                                            ref ClIncrementFromRear);
+            StallDelayBonus = wingInteraction.EffectiveStallDelayBonus;
             double effectiveUpstreamInfluence = wingInteraction.EffectiveUpstreamInfluence;
 
             if (effectiveUpstreamInfluence > 0)
@@ -994,8 +1017,61 @@ namespace ferram4
             stall = stall.Clamp(0, 1);
             if (stall < 1e-5)
                 stall = 0;
+
+            // Coherent LERX / strake maintains vortex suction instead of conventional 2D separation
+            if (IsStrake && VortexBurstFraction < 0.5)
+            {
+                stall = Math.Min(stall, VortexBurstFraction);
+            }
         }
 
+        private void UpdateStrakeStatus()
+        {
+            FerramAerospaceResearch.FARAeroComponents.FARVortexAero.StrakeMode mode =
+                FerramAerospaceResearch.FARAeroComponents.FARVortexAero.StrakeMode.Auto;
+            if (strakeModeString == "Force LERX/Strake")
+                mode = FerramAerospaceResearch.FARAeroComponents.FARVortexAero.StrakeMode.ForceLERX;
+            else if (strakeModeString == "Force Winglet")
+                mode = FerramAerospaceResearch.FARAeroComponents.FARVortexAero.StrakeMode.ForceWinglet;
+            else if (strakeModeString == "Force Waverider")
+                mode = FerramAerospaceResearch.FARAeroComponents.FARVortexAero.StrakeMode.ForceWaverider;
+            else if (strakeModeString == "Force Conventional")
+                mode = FerramAerospaceResearch.FARAeroComponents.FARVortexAero.StrakeMode.ForceConventional;
+
+            double sweepRad = Math.Acos(cosSweepAngle.Clamp(0.0, 1.0));
+            double sweepDeg = sweepRad * (180.0 / Math.PI);
+            double ar = transformed_AR > 0.05 ? transformed_AR : (2.0 * b_2_actual / Math.Max(0.05, MAC_actual));
+
+            if (mode == FerramAerospaceResearch.FARAeroComponents.FARVortexAero.StrakeMode.ForceLERX)
+            {
+                IsStrake = true;
+                IsWinglet = false;
+                IsWaverider = false;
+            }
+            else if (mode == FerramAerospaceResearch.FARAeroComponents.FARVortexAero.StrakeMode.ForceWinglet)
+            {
+                IsStrake = false;
+                IsWinglet = true;
+                IsWaverider = false;
+            }
+            else if (mode == FerramAerospaceResearch.FARAeroComponents.FARVortexAero.StrakeMode.ForceWaverider)
+            {
+                IsStrake = false;
+                IsWinglet = false;
+                IsWaverider = true;
+            }
+            else if (mode == FerramAerospaceResearch.FARAeroComponents.FARVortexAero.StrakeMode.ForceConventional)
+            {
+                IsStrake = false;
+                IsWinglet = false;
+                IsWaverider = false;
+            }
+            else
+            {
+                IsStrake = FerramAerospaceResearch.FARAeroComponents.FARVortexAero.IsGeometricStrake(ar, sweepDeg);
+                IsWaverider = FerramAerospaceResearch.FARAeroComponents.FARVortexAero.IsGeometricWaverider(ar, sweepDeg);
+            }
+        }
 
         /// <summary>
         ///     This calculates the lift and drag coefficients
@@ -1006,6 +1082,7 @@ namespace ferram4
 
             rawLiftSlope = CalculateSubsonicLiftSlope(MachNumber); // / AoA;     //Prandtl lifting Line
 
+            UpdateStrakeStatus();
 
             CalculateWingCamberInteractions(MachNumber, AoA, out double ACshift, out double ACweight);
             DetermineStall(AoA);
@@ -1021,13 +1098,47 @@ namespace ferram4
             double Cd0 = CdCompressibilityZeroLiftIncrement(MachNumber, cosSweepAngle, TanSweep, beta_TanSweep, beta) +
                          2 * skinFrictionCoefficient;
             double CdMax = CdMaxFlatPlate(MachNumber, beta);
-            e = FARAeroUtil.CalculateOswaldsEfficiencyNitaScholz(effective_AR, cosSweepAngle, Cd0, TaperRatio);
-            piARe = effective_AR * e * Math.PI;
+
+            // Apply winglet vortex diffusion benefits: boosted effective AR and Oswald efficiency
+            double wingletArMult = (wingInteraction != null) ? wingInteraction.WingletARMultiplier : 1.0;
+            double wingletEMult = (wingInteraction != null) ? wingInteraction.WingletEfficiencyMultiplier : 1.0;
+
+            double wingletBoostedAR = (effective_AR * wingletArMult).Clamp(0.25, 35d);
+            e = FARAeroUtil.CalculateOswaldsEfficiencyNitaScholz(wingletBoostedAR, cosSweepAngle, Cd0, TaperRatio);
+            e *= wingletEMult;
+            piARe = wingletBoostedAR * e * Math.PI;
 
             double CosAoA = Math.Cos(AoA);
 
-            if (MachNumber <= 0.8)
+            if (IsStrake && MachNumber <= 1.2)
             {
+                double sweepRad = Math.Acos(cosSweepAngle.Clamp(0.0, 1.0));
+                double ar = transformed_AR > 0.05 ? transformed_AR : (2.0 * b_2_actual / Math.Max(0.05, MAC_actual));
+
+                FerramAerospaceResearch.FARAeroComponents.FARVortexAero.CalculateStrakeAero(
+                    AoA,
+                    MachNumber,
+                    ar,
+                    sweepRad,
+                    out double strakeCl,
+                    out double strakeCdi,
+                    out double burstFrac,
+                    out double acShiftFrac);
+
+                VortexBurstFraction = burstFrac;
+                vortexStatus = burstFrac > 0.05 ? $"Bursting ({burstFrac * 100:F0}%)" : "Vortex Coherent";
+
+                Cl = strakeCl;
+                Cd = strakeCdi + Cd0;
+                FinalLiftSlope = Math.Abs(Cl / Math.Max(1e-4, Math.Sin(AoA)));
+
+                if (acShiftFrac > 0.0)
+                    ACshift += acShiftFrac * MAC_actual;
+            }
+            else if (MachNumber <= 0.8)
+            {
+                vortexStatus = "Conventional";
+                VortexBurstFraction = 0.0;
                 double Cn = liftslope;
                 FinalLiftSlope = liftslope;
                 double sinAoA = Math.Sqrt((1 - CosAoA * CosAoA).Clamp(0, 1));
@@ -1047,17 +1158,41 @@ namespace ferram4
              */
             else if (MachNumber > 1.4)
             {
-                double coefMult = 2 / (FARAeroUtil.CurrentAdiabaticIndex * MachNumber * MachNumber);
+                double sweepRad = Math.Acos(cosSweepAngle.Clamp(0.0, 1.0));
 
-                double supersonicLENormalForceFactor = CalculateSupersonicLEFactor(beta, TanSweep, beta_TanSweep);
+                if (IsWaverider && MachNumber >= 1.8)
+                {
+                    FerramAerospaceResearch.FARAeroComponents.FARVortexAero.CalculateWaveriderHypersonicAero(
+                        AoA,
+                        MachNumber,
+                        sweepRad,
+                        out double clWave,
+                        out double cdWave,
+                        out bool shockAttached);
 
-                double normalForce = GetSupersonicPressureDifference(MachNumber, AoA);
-                FinalLiftSlope = coefMult * normalForce * supersonicLENormalForceFactor;
+                    double waveLD = Math.Abs(clWave / Math.Max(1e-4, cdWave + Cd0));
+                    shockStateDisplay = shockAttached
+                        ? $"Attached (L/D: {waveLD:F1})"
+                        : "Detached (Spillage)";
+                    Cl = clWave;
+                    Cd = cdWave + Cd0;
+                    FinalLiftSlope = Math.Abs(Cl / Math.Max(1e-4, Math.Sin(AoA)));
+                }
+                else
+                {
+                    shockStateDisplay = MachNumber >= 1.8 ? "Conventional Supersonic" : "None";
+                    double coefMult = 2 / (FARAeroUtil.CurrentAdiabaticIndex * MachNumber * MachNumber);
 
-                Cl = FinalLiftSlope * CosAoA * Math.Sign(AoA);
-                Cd = beta * Cl * Cl / piARe;
+                    double supersonicLENormalForceFactor = CalculateSupersonicLEFactor(beta, TanSweep, beta_TanSweep);
 
-                Cd += Cd0;
+                    double normalForce = GetSupersonicPressureDifference(MachNumber, AoA);
+                    FinalLiftSlope = coefMult * normalForce * supersonicLENormalForceFactor;
+
+                    Cl = FinalLiftSlope * CosAoA * Math.Sign(AoA);
+                    Cd = beta * Cl * Cl / piARe;
+
+                    Cd += Cd0;
+                }
             }
             /*
              * Transonic nonlinear lift / drag code
@@ -1126,6 +1261,40 @@ namespace ferram4
             Cl -= Cl * stall * 0.769;
             Cd += Cd * stall * 3;
             Cd = Math.Max(Cd, CdMax * (1 - CosAoA * CosAoA));
+
+            // Ground Effect (Wieselsberger mirror vortex model)
+            if (HighLogic.LoadedSceneIsFlight && vessel != null)
+            {
+                double alt = vessel.radarAltitude;
+                double span = Math.Max(b_2_actual * 2.0, 2.0);
+                FerramAerospaceResearch.FARAeroComponents.FARVortexAero.CalculateGroundEffect(
+                    alt, span, out double geDragFactor, out double geLiftMult);
+                if (geDragFactor < 0.999)
+                {
+                    Cd = (Cd - Cd0) * geDragFactor + Cd0;
+                    Cl *= geLiftMult;
+                }
+            }
+
+            if (StallDelayBonus > 0.001)
+                stallDelayDisplay = $"+{StallDelayBonus * (180.0 / Math.PI):F1}° (LERX Active)";
+            else
+                stallDelayDisplay = "0.0°";
+
+            if (IsWinglet)
+            {
+                wingletBenefitDisplay = "Winglet (Diffusing Tip Vortex)";
+            }
+            else if (wingInteraction != null && wingInteraction.WingletARMultiplier > 1.001)
+            {
+                double arBoostPct = (wingInteraction.WingletARMultiplier - 1.0) * 100.0;
+                double dragCutPct = (1.0 - 1.0 / (wingInteraction.WingletARMultiplier * wingInteraction.WingletEfficiencyMultiplier)) * 100.0;
+                wingletBenefitDisplay = $"+{arBoostPct:F1}% AR (-{dragCutPct:F0}% Cdi)";
+            }
+            else
+            {
+                wingletBenefitDisplay = "None";
+            }
 
             AerodynamicCenter += ACShiftVec;
 
@@ -1286,6 +1455,7 @@ namespace ferram4
                              tmp;
             }
 
+            StallAngle += StallDelayBonus;
             return StallAngle;
         }
 
