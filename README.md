@@ -6,6 +6,7 @@ Download latest build [here](https://nightly.link/dkavolis/Ferram-Aerospace-Rese
 Fork of FARc meant for more of a focus on realism.
 Thank you to dkavolis for creating the original mod.
 Developed with the assistance of Google Antigravity and Github Copilot.
+***Every non-human change was thoroughly checked and playtested by a human***
 
 ### Major additions:
 - Polhamus LERX Vortex lift
